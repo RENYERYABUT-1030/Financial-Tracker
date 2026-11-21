@@ -1,0 +1,94 @@
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+/** Run with java -cp out LedgerDataTest. No database or GUI is required. */
+public class LedgerDataTest {
+    private static void check(boolean condition, String message) {
+        if (!condition) throw new AssertionError(message);
+    }
+    private static void equal(double expected, double actual, String message) {
+        check(Math.abs(expected - actual) < 0.00001, message + ": " + actual);
+    }
+    public static void main(String[] args) throws Exception {
+        Path home = Files.createTempDirectory("ledger-test-");
+        Path student = FinancialTracker.dataPath(home, "student");
+        Path admin = FinancialTracker.dataPath(home, "admin");
+        check(!student.equals(admin), "Separate user files");
+        check(student.equals(FinancialTracker.dataPath(home, "STUDENT")), "Case-insensitive login");
+        check(FinancialTracker.dataPath(home, "../unsafe").getParent().equals(home.resolve("LedgerData")),
+                "File name cannot escape data directory");
+        YearMonth month = YearMonth.now();
+        YearMonth prior = month.minusMonths(1);
+        LocalDate today = LocalDate.now();
+        LocalDate monthEnd = LocalDate.of(2026, 11, 30);
+        javax.swing.SpinnerDateModel dates = FinancialTracker.expenseDateModel(monthEnd);
+        check(dates.getValue().equals(FinancialTracker.spinnerDate(monthEnd)), "Defaults to present date");
+        check(dates.getPreviousValue() == null, "Cannot step into old dates");
+        dates.setCalendarField(java.util.Calendar.MONTH);
+        check(dates.getNextValue().equals(FinancialTracker.spinnerDate(monthEnd.plusDays(1))), "Continues one day into next month");
+        check(!FinancialTracker.allowedExpenseDate(today.minusDays(1), today), "Reject manually typed past date");
+        check(FinancialTracker.allowedExpenseDate(today, today), "Allow today");
+        check(FinancialTracker.allowedExpenseDate(today.plusDays(1), today), "Allow tomorrow");
+        FinancialTracker.LedgerData data = new FinancialTracker.LedgerData();
+        data.allowances.put(month, 2000.0);
+        data.allowances.put(prior, 900.0);
+        data.incomes.add(new FinancialTracker.MoneyEntry(today, "Part-time, work", 500));
+        data.expenses.add(new FinancialTracker.Expense(today, "Lunch, \"rice\" ₱", "Food", 150));
+        data.expenses.add(new FinancialTracker.Expense(today, "Jeep", "Transport", 50));
+        data.expenses.add(new FinancialTracker.Expense(prior.atDay(1), "Old lunch", "Food", 100));
+        data.categories.add("School supplies");
+        data.plan(month).put("Food", 300.0);
+        data.plan(prior).put("Food", 200.0);
+        data.goals.add(new FinancialTracker.Goal("Laptop", 5000, 250, month.plusMonths(4).toString()));
+        data.deposits.add(new FinancialTracker.MoneyEntry(today, "Laptop", 250));
+        data.deleted.push(new FinancialTracker.Expense(today, "Undo me", "Other", 15));
+        data.save(student);
+
+        FinancialTracker.LedgerData restored = new FinancialTracker.LedgerData();
+        restored.load(student);
+        equal(2100 - 50, restored.balance(month), "This month's balance");
+        equal(800, restored.balance(prior), "Previous month balance");
+        equal(150, restored.spent(month, "Food"), "Category total");
+        equal(250, restored.savings(month), "Savings deduction");
+        equal(500, restored.extraIncome(month), "Additional income");
+        equal(300, restored.plan(month).get("Food"), "Current plan");
+        equal(200, restored.plan(prior).get("Food"), "Past plan");
+        check(restored.expenses.size() == 3 && restored.expenseCount(month) == 2, "History saved");
+        check(restored.goals.size() == 1 && restored.goals.get(0).saved == 250, "Goal saved");
+        check(restored.categories.contains("School supplies"), "Custom category saved");
+        check(restored.deleted.peek().description.equals("Undo me"), "Undo stack saved");
+        check(restored.expenses.get(0).description.equals("Lunch, \"rice\" ₱"), "Unicode and quoting round trip");
+        FinancialTracker.LedgerData other = new FinancialTracker.LedgerData();
+        other.load(admin);
+        equal(0, other.balance(month), "Other account starts empty");
+        check(other.expenses.isEmpty() && other.goals.isEmpty(), "No cross-account data");
+        restored.expenses.add(restored.deleted.pop());
+        restored.save(student);
+        FinancialTracker.LedgerData afterUndo = new FinancialTracker.LedgerData();
+        afterUndo.load(student);
+        check(afterUndo.deleted.isEmpty() && afterUndo.expenses.size() == 4, "Undo persists");
+        equal(2035, afterUndo.balance(month), "Balance after undo");
+
+        ArrayList<FinancialTracker.Expense> list = new ArrayList<FinancialTracker.Expense>(afterUndo.expenses);
+        FinancialTracker.sortExpenses(list, 2);
+        check(list.get(0).amount == 150 && list.get(list.size() - 1).amount == 15, "Bubble sort descending");
+        FinancialTracker.sortExpenses(list, 1);
+        check(list.get(0).date.equals(prior.atDay(1)), "Bubble sort by date");
+        check(FinancialTracker.matches(list.get(0), "old") &&
+                FinancialTracker.matches(list.get(0), "100.00"), "Linear search");
+        for (String invalid : Arrays.asList("NaN", "Infinity", "-1", "1,2", "0.001", "abc"))
+            equal(0, FinancialTracker.readAmount(invalid), "Invalid amount " + invalid);
+        equal(1250.50, FinancialTracker.readAmount("1,250.50"), "Valid formatted amount");
+        Path csv = home.resolve("report.csv");
+        restored.exportCsv(csv, month);
+        String report = new String(Files.readAllBytes(csv), StandardCharsets.UTF_8);
+        check(report.contains("\"Lunch, \"\"rice\"\" ₱\"") && report.contains("2035.00")
+                && !report.contains("Old lunch"), "CSV selection, totals and escaping");
+        System.out.println("PASS: dates, persistence, account isolation, monthly totals, savings, income, budgets, undo, sorting, search, amount validation and CSV.");
+    }
+}
