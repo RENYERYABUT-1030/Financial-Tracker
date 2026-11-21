@@ -46,7 +46,7 @@ public class LedgerDataTest {
         data.plan(prior).put("Food", 200.0);
         data.goals.add(new FinancialTracker.Goal("Laptop", 5000, 250, month.plusMonths(4).toString()));
         data.deposits.add(new FinancialTracker.MoneyEntry(today, "Laptop", 250));
-        data.deleted.push(new FinancialTracker.Expense(today, "Undo me", "Other", 15));
+        data.undoHistory.push(new FinancialTracker.ExpenseChange(new FinancialTracker.Expense(today, "Undo me", "Other", 15), null));
         data.save(student);
 
         FinancialTracker.LedgerData restored = new FinancialTracker.LedgerData();
@@ -77,24 +77,24 @@ public class LedgerDataTest {
         check(restored.expenses.size() == 3 && restored.expenseCount(month) == 2, "History saved");
         check(restored.goals.size() == 1 && restored.goals.get(0).saved == 250, "Goal saved");
         check(restored.categories.contains("School supplies"), "Custom category saved");
-        check(restored.deleted.peek().description.equals("Undo me"), "Undo stack saved");
+        check(restored.undoHistory.peek().before.description.equals("Undo me"), "Undo stack saved");
         check(restored.expenses.get(0).description.equals("Lunch, \"rice\" ₱"), "Unicode and quoting round trip");
         FinancialTracker.LedgerData other = new FinancialTracker.LedgerData();
         other.load(admin);
         equal(0, other.balance(month), "Other account starts empty");
         check(other.expenses.isEmpty() && other.goals.isEmpty(), "No cross-account data");
-        restored.expenses.add(restored.deleted.pop());
+        restored.undoExpense(today);
         restored.save(student);
         FinancialTracker.LedgerData afterUndo = new FinancialTracker.LedgerData();
         afterUndo.load(student);
-        check(afterUndo.deleted.isEmpty() && afterUndo.expenses.size() == 4, "Undo persists");
+        check(afterUndo.undoHistory.isEmpty() && afterUndo.expenses.size() == 4, "Undo persists");
         equal(2035, afterUndo.balance(month), "Balance after undo");
 
         ArrayList<FinancialTracker.Expense> list = new ArrayList<FinancialTracker.Expense>(afterUndo.expenses);
         FinancialTracker.sortExpenses(list, 2);
-        check(list.get(0).amount == 150 && list.get(list.size() - 1).amount == 15, "Bubble sort descending");
+        check(list.get(0).amount == 150 && list.get(list.size() - 1).amount == 15, "Merge sort descending");
         FinancialTracker.sortExpenses(list, 1);
-        check(list.get(0).date.equals(prior.atDay(1)), "Bubble sort by date");
+        check(list.get(0).date.equals(prior.atDay(1)), "Merge sort by date");
         check(FinancialTracker.matches(list.get(0), "old") &&
                 FinancialTracker.matches(list.get(0), "100.00"), "Linear search");
         for (String invalid : Arrays.asList("NaN", "Infinity", "-1", "1,2", "0.001", "abc"))
@@ -105,6 +105,57 @@ public class LedgerDataTest {
         String report = new String(Files.readAllBytes(csv), StandardCharsets.UTF_8);
         check(report.contains("\"Lunch, \"\"rice\"\" ₱\"") && report.contains("2035.00")
                 && !report.contains("Old lunch"), "CSV selection, totals and escaping");
-        System.out.println("PASS: dashboard cards, month selection, dates, persistence, account isolation, monthly totals, savings, income, budgets, undo, sorting, search, amount validation and CSV.");
+        equal(150, afterUndo.categoryTotals(month).get("Food"), "HashMap category totals");
+        equal(215, afterUndo.yearlySpending(month.getYear())[month.getMonthValue() - 1], "12-month array");
+        afterUndo.rolloverEnabled = true;
+        equal(800, afterUndo.rollover(month), "Positive money carries forward");
+        equal(2835, afterUndo.balance(month), "Balance includes rollover");
+        afterUndo.rolloverEnabled = false;
+        FinancialTracker.LedgerData queue = new FinancialTracker.LedgerData();
+        LocalDate jan31 = LocalDate.of(2027, 1, 31);
+        FinancialTracker.Expense future = new FinancialTracker.Expense(jan31.plusDays(1), "Bus", "Transport", 40);
+        queue.addExpense(future, jan31);
+        check(queue.expenses.isEmpty() && queue.scheduled.size() == 1, "Future expense not counted early");
+        FinancialTracker.Expense edited = future.copy();
+        edited.amount = 60;
+        queue.editExpense(future, edited, jan31);
+        queue.undoExpense(jan31);
+        equal(40, queue.scheduled.peek().amount, "Undo edit");
+        check(queue.postDue(jan31.plusDays(1)) == 1, "Post due expense");
+        queue.undoExpense(jan31.plusDays(1));
+        check(queue.expenses.isEmpty(), "Undo add even after schedule posts");
+        queue.scheduleMonthly(new FinancialTracker.Expense(jan31, "Subscription", "Other", 100), jan31);
+        check(queue.scheduled.peek().date.equals(LocalDate.of(2027, 2, 28)), "Monthly end-of-month recurrence");
+        check(queue.postDue(LocalDate.of(2027, 3, 31)) == 2, "Catch up on missed recurring entries");
+        check(queue.scheduled.peek().date.equals(LocalDate.of(2027, 4, 30)) && queue.expenses.size() == 3, "Monthly anchor restored");
+        check(queue.postDue(LocalDate.of(2027, 3, 31)) == 0, "No double posting");
+        queue.owner = "student";
+        Path backup = home.resolve("backup.properties");
+        queue.save(backup);
+        FinancialTracker.LedgerData snapshot = new FinancialTracker.LedgerData();
+        snapshot.owner = "student";
+        snapshot.load(backup);
+        check(snapshot.scheduled.size() == 1 && snapshot.expenses.size() == 3, "Schedule saved in backup");
+        java.util.Properties legacy = new java.util.Properties();
+        try (java.io.Reader reader = Files.newBufferedReader(backup, StandardCharsets.UTF_8)) { legacy.load(reader); }
+        legacy.setProperty("version", "1");
+        legacy.setProperty("undo.count", "0");
+        legacy.remove("owner");
+        Path oldFile = home.resolve("old-version.properties");
+        try (java.io.Writer writer = Files.newBufferedWriter(oldFile, StandardCharsets.UTF_8)) { legacy.store(writer, "Migration fixture"); }
+        FinancialTracker.LedgerData migrated = new FinancialTracker.LedgerData();
+        migrated.load(oldFile);
+        check(migrated.expenses.size() + migrated.scheduled.size() == 3, "Legacy records survive migration");
+        FinancialTracker.LedgerData wrong = new FinancialTracker.LedgerData();
+        wrong.owner = "admin";
+        try { wrong.load(backup); throw new AssertionError("Cross-account backup accepted"); }
+        catch (java.io.IOException expected) { }
+        FinancialTracker.User user = new FinancialTracker.User("test", "personalPassword");
+        FinancialTracker.User user2 = new FinancialTracker.User("test", "personalPassword");
+        check(!user.passwordHash.equals(user2.passwordHash), "Unique salts");
+        check(!user.passwordHash.contains("personalPassword"), "Passwords not stored plaintext");
+        check(FinancialTracker.User.fromStored("test", user.passwordHash).verify("personalPassword"), "Hash verification after load");
+        check(!user.verify("wrongPassword"), "Wrong password rejected");
+        System.out.println("PASS: dashboard, persistence, month selection, dates, account isolation, totals, savings, income, budgets, undo, merge sort, search, validation, CSV, HashMap, yearly array, rollover, schedules, backups and password hashing.");
     }
 }

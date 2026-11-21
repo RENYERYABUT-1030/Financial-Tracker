@@ -1,4 +1,4 @@
-# Ledger - Student Financial Tracker
+# Ledger - Personal Finance Edition
 
 Ledger is an offline Java Swing application for a Data Structures class project.
 It manages monthly allowances, additional income, expenses, savings goals and
@@ -43,19 +43,22 @@ shows an error and retries before closing or logging out. Keep only one open
 instance per account to avoid simultaneous edits. Use the app's normal login
 and do not edit the save files directly.
 
-Passwords are still plain text as in the original classroom project; local
-files are not encrypted. Do not use real banking passwords or treat Ledger as
-a secure financial vault.
+Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes. Existing account
+passwords are migrated automatically when opening the new login screen.
+Your existing login still works. New accounts require at least eight
+characters. Financial records and backups are local plaintext files, not
+encrypted storage. Use a personal account rather than the demo accounts and
+do not reuse banking passwords. Older app versions cannot read hashed logins.
 
 ## Features
 
 | Tab | Function |
 | --- | --- |
-| Dashboard | Current-month totals, remaining daily budget, category warnings |
-| Expenses | Add, edit, delete, undo, search by description/category/date/amount, sort, filter by month/date range/category |
+| Dashboard | Monthly totals, daily budget, category warnings, spending insights, upcoming-expense projection |
+| Expenses | Add, edit, delete, undo, searching, merge sort, filters and upcoming/recurring expenses |
 | Savings Goals | Set target and deadline, add money from available monthly balance, get daily savings advice |
-| Allowance | Set the current month's allowance, add extra income, plan budgets per category |
-| Reports | Select a month, review income/expenses/savings/balance, view spending charts, export that month's CSV |
+| Allowance | Set allowance, extra income, category budgets, optional positive-balance rollover |
+| Reports | Monthly charts, annual spending summary, CSV export |
 
 Under Expenses, select **Filters / history...** and leave the month blank
 to see expenses from all months. Use **Savings advice** after selecting a goal.
@@ -66,12 +69,29 @@ spinner moves forward or backward one day at a time, but cannot go before
 today; future dates are allowed. The minimum automatically advances as
 days pass. Existing historical expenses keep their original date.
 
-Each month is independent; unused allowance is not automatically carried
-forward to the next month. Past expense records and past monthly totals stay
+Future expenses are scheduled, not deducted until their due date. Fill in
+the expense form and select **Repeat monthly...** to schedule a monthly bill.
+The app records due expenses automatically while open and catches up when
+you reopen it. This records expected expenses locally; it does not make
+actual payments. Use **Upcoming...** to cancel future schedules. Monthly
+recurrence uses the original day or the last day of shorter months.
+
+Undo reverses the last ordinary expense addition, edit or deletion,
+including one-time scheduled expenses. Recurring rule cancellations are
+not undoable; create a new rule if needed.
+
+By default each month is independent. To carry positive unused funds into
+the next month, enable **Carry unused money into next month** in Allowance.
+Past expense records and past monthly totals stay
 available. Savings deposits are recorded against the current month and
 deducted from available money. Goals with saved funds cannot be deleted to
 protect their history. Changing a goal name does not rewrite historical
 deposit descriptions.
+
+Use **Backup / restore...** in the header to save or restore a snapshot of
+the current account. Restoring replaces the current records only after
+confirmation and creates a safety copy first. Older data snapshots are
+supported. Do not share backups publicly.
 
 The Dashboard's **Show month** selector controls all four summary cards and
 the category breakdown together. It initially opens the current month if
@@ -83,7 +103,7 @@ record the amount; typing alone is not a saved transaction. Historical months
 show a dash for the daily budget because no days remain.
 
 ```text
-Remaining balance = allowance + extra income - expenses - savings deposits
+Remaining balance = allowance + extra income + optional rollover - expenses - savings deposits
 Daily budget = max(remaining balance, 0) / remaining days (including today)
 ```
 
@@ -91,11 +111,13 @@ Daily budget = max(remaining balance, 0) / remaining days (including today)
 
 | Data structure | Purpose |
 | --- | --- |
-| Array | Default expense categories |
+| Array | Default categories and 12 monthly spending totals |
 | ArrayList | Expenses, goals, categories, accounts, dated income and savings entries |
-| HashMap | Allowances and category budgets by month |
-| Stack | Undo deleted expenses, last in first out |
-| Bubble sort | Expense ordering, monthly report selection and category charts |
+| HashMap | Allowances, category budgets, single-traversal spending aggregation |
+| Stack | Undo added, edited, and deleted expenses, last in first out |
+| PriorityQueue | Upcoming expenses processed by earliest due date |
+| Merge sort | Stable expense ordering, O(n log n) comparisons |
+| Bubble sort | Monthly report selection and category charts |
 | Linear search / traversal | Login, expense search, filters, totals |
 
 The data structures operate in memory. File handling preserves them after
