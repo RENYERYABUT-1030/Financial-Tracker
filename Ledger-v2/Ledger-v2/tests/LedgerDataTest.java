@@ -53,6 +53,22 @@ public class LedgerDataTest {
         restored.load(student);
         equal(2100 - 50, restored.balance(month), "This month's balance");
         equal(800, restored.balance(prior), "Previous month balance");
+        FinancialTracker.DashboardTotals cards = restored.dashboardTotals(month, today);
+        equal(2000, cards.allowance, "Dashboard monthly allowance");
+        equal(200, cards.spent, "Dashboard total spent");
+        equal(2050, cards.balance, "Dashboard remaining money");
+        int remainingDays = month.lengthOfMonth() - today.getDayOfMonth() + 1;
+        equal(FinancialTracker.LedgerData.cents(2050.0 / remainingDays), cards.dailyBudget, "Dashboard daily budget");
+        check(cards.expenseCount == 2, "Dashboard count after restart");
+        check(restored.dashboardTotals(prior, today).remainingDays == 0, "Past month has no remaining days");
+        FinancialTracker.LedgerData historic = new FinancialTracker.LedgerData();
+        historic.expenses.add(new FinancialTracker.Expense(prior.atDay(1), "Old entry", "Food", 75));
+        historic.allowances.put(prior, 500.0);
+        check(historic.initialDashboardMonth(month).equals(prior), "Dashboard finds existing historical data");
+        equal(425, historic.dashboardTotals(prior, today).balance, "Historic dashboard balance");
+        historic.allowances.put(month, 1000.0);
+        check(historic.initialDashboardMonth(month).equals(month), "Current activity takes priority");
+        check(restored.dashboardTotals(month.plusMonths(1), today).remainingDays == month.plusMonths(1).lengthOfMonth(), "Future month day calculation");
         equal(150, restored.spent(month, "Food"), "Category total");
         equal(250, restored.savings(month), "Savings deduction");
         equal(500, restored.extraIncome(month), "Additional income");
@@ -89,6 +105,6 @@ public class LedgerDataTest {
         String report = new String(Files.readAllBytes(csv), StandardCharsets.UTF_8);
         check(report.contains("\"Lunch, \"\"rice\"\" ₱\"") && report.contains("2035.00")
                 && !report.contains("Old lunch"), "CSV selection, totals and escaping");
-        System.out.println("PASS: dates, persistence, account isolation, monthly totals, savings, income, budgets, undo, sorting, search, amount validation and CSV.");
+        System.out.println("PASS: dashboard cards, month selection, dates, persistence, account isolation, monthly totals, savings, income, budgets, undo, sorting, search, amount validation and CSV.");
     }
 }

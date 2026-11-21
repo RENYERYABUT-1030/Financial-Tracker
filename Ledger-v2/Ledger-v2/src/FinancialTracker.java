@@ -166,6 +166,9 @@ public class FinancialTracker extends JFrame {
     private JLabel leftValueLabel;
     private JLabel perDayValueLabel;
     private JTextArea summaryArea;
+    private JComboBox<String> dashboardMonthBox;
+    private YearMonth dashboardMonth;
+    private boolean fillingDashboardMonths;
 
     // Expenses
     private JTextField descriptionField;
@@ -267,6 +270,8 @@ public class FinancialTracker extends JFrame {
         } catch (IOException | RuntimeException e) {
             throw new IllegalStateException("Could not load your Ledger data. The saved file was not changed.", e);
         }
+        dashboardMonth = data.initialDashboardMonth(YearMonth.now());
+        expenseMonth = dashboardMonth;
 
         setTitle("Ledger - Student Financial Tracker");
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
@@ -289,9 +294,16 @@ public class FinancialTracker extends JFrame {
 
         createContents();
         // If the tracker stays open overnight, advance the minimum date automatically.
-        dateRefreshTimer = new javax.swing.Timer(30000, e -> refreshDateFloor());
+        dateRefreshTimer = new javax.swing.Timer(30000, e -> {
+            if (!LocalDate.now().equals(dateFloor)) {
+                refreshDateFloor();
+                refreshCurrentMonth();
+                refreshAll();
+            }
+        });
         dateRefreshTimer.start();
         allowanceField.setText(MONEY.format(data.allowance(YearMonth.now())));
+        refreshFilterLabel();
         rebuildExpenseTable();
         refreshAll();
     }
@@ -346,21 +358,25 @@ public class FinancialTracker extends JFrame {
         tabbedPane.addTab("Reports", null, createReportsPanel(), null);
         tabbedPane.addChangeListener(e -> {
             refreshDateFloor();
-            YearMonth now = YearMonth.now();
-            if (!now.equals(activeMonth)) {
-                if (activeMonth.equals(expenseMonth)) {
-                    expenseMonth = now;
-                    refreshFilterLabel();
-                }
-                activeMonth = now;
-                allowanceField.setText(MONEY.format(data.allowance(now)));
-                rebuildExpenseTable();
-            }
+            refreshCurrentMonth();
             refreshAll();
         });
         contentPane.add(tabbedPane, BorderLayout.CENTER);
 
         contentPane.add(createStatusBar(), BorderLayout.SOUTH);
+    }
+
+    private void refreshCurrentMonth() {
+        YearMonth now = YearMonth.now();
+        if (now.equals(activeMonth)) return;
+        if (activeMonth.equals(expenseMonth)) {
+            expenseMonth = now;
+            refreshFilterLabel();
+        }
+        if (activeMonth.equals(dashboardMonth)) dashboardMonth = now;
+        activeMonth = now;
+        allowanceField.setText(MONEY.format(data.allowance(now)));
+        rebuildExpenseTable();
     }
 
     private JPanel createHeader() {
@@ -454,6 +470,21 @@ public class FinancialTracker extends JFrame {
         JLabel summaryTitle = new JLabel("Summary of your data");
         summaryTitle.setFont(BOLD_FONT);
         summaryTitle.setForeground(INK);
+        JPanel summaryHeader = new JPanel(new BorderLayout(8, 0));
+        summaryHeader.setOpaque(false);
+        summaryHeader.add(summaryTitle, BorderLayout.WEST);
+        JPanel monthChooser = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        monthChooser.setOpaque(false);
+        monthChooser.add(smallLabel("SHOW MONTH"));
+        dashboardMonthBox = new JComboBox<String>();
+        dashboardMonthBox.addActionListener(e -> {
+            if (!fillingDashboardMonths && dashboardMonthBox.getSelectedItem() != null) {
+                dashboardMonth = YearMonth.parse(dashboardMonthBox.getSelectedItem().toString());
+                refreshDashboard();
+            }
+        });
+        monthChooser.add(dashboardMonthBox);
+        summaryHeader.add(monthChooser, BorderLayout.EAST);
 
         summaryArea = new JTextArea();
         summaryArea.setEditable(false);
@@ -465,7 +496,7 @@ public class FinancialTracker extends JFrame {
         JScrollPane scroll = new JScrollPane(summaryArea);
         scroll.setBorder(new MatteBorder(1, 1, 1, 1, BORDER));
 
-        middle.add(summaryTitle, BorderLayout.NORTH);
+        middle.add(summaryHeader, BorderLayout.NORTH);
         middle.add(scroll, BorderLayout.CENTER);
 
         panel.add(middle, BorderLayout.CENTER);
@@ -931,6 +962,7 @@ public class FinancialTracker extends JFrame {
         form.setBorder(new EmptyBorder(12, 14, 12, 14));
 
         allowanceField = new JTextField();
+        allowanceField.addActionListener(e -> saveAllowance());
         allowanceField.setPreferredSize(new Dimension(150, 28));
         allowanceField.setFont(LABEL_FONT);
 
@@ -1091,6 +1123,7 @@ public class FinancialTracker extends JFrame {
         if (date == null) return;
         Expense expense = new Expense(date, description, category, amount);
         expenses.add(expense);
+        revealExpenseMonth(expense.date);
 
         descriptionField.setText("");
         amountField.setText("");
@@ -1141,6 +1174,7 @@ public class FinancialTracker extends JFrame {
         expense.amount = amount;
         expense.category = category;
         expense.date = date;
+        revealExpenseMonth(expense.date);
 
         stopEditingExpense();
         rebuildExpenseTable();
@@ -1174,6 +1208,7 @@ public class FinancialTracker extends JFrame {
         }
 
         expenses.remove(expense);
+        dashboardMonth = YearMonth.from(expense.date);
         deleted.push(expense);
         stopEditingExpense();
         rebuildExpenseTable();
@@ -1187,8 +1222,21 @@ public class FinancialTracker extends JFrame {
         }
         Expense expense = deleted.pop();
         expenses.add(expense);
+        revealExpenseMonth(expense.date);
         rebuildExpenseTable();
         changed();
+    }
+
+    /** Show the month of the saved record, even if it differs from today's month. */
+    private void revealExpenseMonth(LocalDate date) {
+        dashboardMonth = YearMonth.from(date);
+        // Clear only the temporary display filters, not any saved financial records.
+        expenseMonth = dashboardMonth;
+        expenseFrom = null;
+        expenseTo = null;
+        expenseCategory = null;
+        if (searchField != null) searchField.setText("");
+        if (filterInfo != null) refreshFilterLabel();
     }
 
     private void addNewCategory() {
@@ -1494,6 +1542,7 @@ public class FinancialTracker extends JFrame {
         }
         goal.saved = LedgerData.cents(goal.saved + amount);
         data.deposits.add(new MoneyEntry(LocalDate.now(), goal.name, amount));
+        dashboardMonth = YearMonth.now();
         depositField.setText("");
 
         rebuildGoalTable();
@@ -1566,6 +1615,7 @@ public class FinancialTracker extends JFrame {
         }
 
         data.allowances.put(YearMonth.now(), value);
+        dashboardMonth = YearMonth.now();
         boolean saved = changed();
         allowanceMessageLabel.setForeground(saved ? GREEN : RED);
         allowanceMessageLabel.setText(saved ? "Allowance saved." : "Not yet saved to disk.");
@@ -1582,6 +1632,7 @@ public class FinancialTracker extends JFrame {
             return;
         }
         data.incomes.add(new MoneyEntry(LocalDate.now(), source.getText().trim(), amount));
+        dashboardMonth = YearMonth.now();
         changed();
     }
 
@@ -1599,6 +1650,7 @@ public class FinancialTracker extends JFrame {
 
         // HashMap put: if the key is already there, the value is replaced.
         planned().put(category, Double.valueOf(amount));
+        dashboardMonth = YearMonth.now();
         planAmountField.setText("");
         rebuildPlanTable();
         changed();
@@ -1606,6 +1658,7 @@ public class FinancialTracker extends JFrame {
 
     private void clearPlan() {
         planned().clear();
+        dashboardMonth = YearMonth.now();
         rebuildPlanTable();
         changed();
     }
@@ -1645,6 +1698,7 @@ public class FinancialTracker extends JFrame {
     // ------------------------------------------------------------------
 
     private void refreshAll() {
+        updateDashboardMonths();
         refreshDashboard();
         rebuildGoalTable();
         rebuildPlanTable();
@@ -1657,30 +1711,46 @@ public class FinancialTracker extends JFrame {
         }
     }
 
+    private void updateDashboardMonths() {
+        if (dashboardMonthBox == null) return;
+        if (dashboardMonth == null) dashboardMonth = data.initialDashboardMonth(YearMonth.now());
+        ArrayList<YearMonth> choices = data.months();
+        if (!choices.contains(dashboardMonth)) choices.add(dashboardMonth);
+        fillingDashboardMonths = true;
+        dashboardMonthBox.removeAllItems();
+        for (YearMonth choice : choices) dashboardMonthBox.addItem(choice.toString());
+        dashboardMonthBox.setSelectedItem(dashboardMonth.toString());
+        fillingDashboardMonths = false;
+    }
+
     private void refreshDashboard() {
         if (allowanceValueLabel == null) {
             return;
         }
 
-        YearMonth month = YearMonth.now();
-        double allowance = data.allowance(month);
-        double extra = data.extraIncome(month);
-        double savings = data.savings(month);
-        double spent = totalSpent();
-        double left = data.balance(month);
-        int daysLeft = month.lengthOfMonth() - LocalDate.now().getDayOfMonth() + 1;
-        double perDay = Math.max(0, left) / daysLeft;
+        YearMonth month = dashboardMonth == null ? YearMonth.now() : dashboardMonth;
+        DashboardTotals totals = data.dashboardTotals(month, LocalDate.now());
+        double allowance = totals.allowance;
+        double extra = totals.income;
+        double savings = totals.savings;
+        double spent = totals.spent;
+        double left = totals.balance;
+        double perDay = totals.dailyBudget;
 
         allowanceValueLabel.setText("₱" + MONEY.format(allowance));
         spentValueLabel.setText("₱" + MONEY.format(spent));
         leftValueLabel.setText("₱" + MONEY.format(left));
         leftValueLabel.setForeground(left < 0 ? RED : GREEN);
-        perDayValueLabel.setText("₱" + MONEY.format(perDay));
+        perDayValueLabel.setText(totals.remainingDays == 0 ? "—" : "₱" + MONEY.format(perDay));
         perDayValueLabel.setForeground(perDay < 0 ? RED : new Color(2, 132, 199));
 
         StringBuilder text = new StringBuilder();
-        int count = data.expenseCount(month);
+        int count = totals.expenseCount;
         text.append("Month             : ").append(month).append("\n");
+        if (!data.hasActivity(month)) {
+            text.append("No saved financial records for this month.\n")
+                    .append("Select another month above, or save an allowance / add an expense.\n\n");
+        }
         text.append("Extra income      : ₱").append(MONEY.format(extra)).append("\n");
         text.append("Savings deposits  : ₱").append(MONEY.format(savings)).append("\n");
         text.append("Expenses recorded : ").append(count).append("\n");
@@ -1690,7 +1760,7 @@ public class FinancialTracker extends JFrame {
             text.append("Average expense  : ₱").append(MONEY.format(spent / count)).append("\n");
         }
 
-        Expense biggest = biggestExpense();
+        Expense biggest = biggestExpense(month);
         if (biggest != null) {
             text.append("Biggest expense  : ").append(biggest.description)
                     .append(" (₱").append(MONEY.format(biggest.amount)).append(")\n");
@@ -1708,7 +1778,7 @@ public class FinancialTracker extends JFrame {
         text.append("---------------------\n");
         for (int i = 0; i < categories.size(); i++) {
             String category = categories.get(i);
-            double amount = spentInCategory(category);
+            double amount = data.spent(month, category);
             if (amount > 0) {
                 text.append(String.format("%-12s ₱%s%n", category, MONEY.format(amount)));
             }
@@ -1716,15 +1786,16 @@ public class FinancialTracker extends JFrame {
 
         text.append("\nPlanned budget (HashMap)\n");
         text.append("------------------------\n");
-        if (planned().isEmpty()) {
+        Map<String, Double> monthPlan = data.plans.get(month);
+        if (monthPlan == null || monthPlan.isEmpty()) {
             text.append("No plan set yet. Open the Allowance tab.\n");
         } else {
             for (int i = 0; i < categories.size(); i++) {
                 String category = categories.get(i);
-                Double amount = planned().get(category);
+                Double amount = monthPlan.get(category);
                 if (amount != null) {
                     text.append(String.format("%-12s ₱%s%n", category, MONEY.format(amount.doubleValue())));
-                    if (spentInCategory(category) > amount)
+                    if (data.spent(month, category) > amount)
                         text.append("  WARNING: category budget exceeded.\n");
                 }
             }
@@ -1769,11 +1840,11 @@ public class FinancialTracker extends JFrame {
     }
 
     /** Linear search for the largest expense. */
-    private Expense biggestExpense() {
+    private Expense biggestExpense(YearMonth month) {
         Expense biggest = null;
         for (int i = 0; i < expenses.size(); i++) {
             Expense expense = expenses.get(i);
-            if (YearMonth.from(expense.date).equals(YearMonth.now())
+            if (YearMonth.from(expense.date).equals(month)
                     && (biggest == null || expense.amount > biggest.amount)) {
                 biggest = expense;
             }
@@ -2175,6 +2246,25 @@ public class FinancialTracker extends JFrame {
     // The data classes (simple boxes that hold data)
     // ------------------------------------------------------------------
 
+    /** All four dashboard cards use this single, consistent month calculation. */
+    static class DashboardTotals {
+        final double allowance, income, savings, spent, balance, dailyBudget;
+        final int remainingDays, expenseCount;
+
+        DashboardTotals(LedgerData data, YearMonth month, LocalDate today) {
+            allowance = data.allowance(month);
+            income = data.extraIncome(month);
+            savings = data.savings(month);
+            spent = data.spent(month, null);
+            balance = data.balance(month);
+            expenseCount = data.expenseCount(month);
+            YearMonth current = YearMonth.from(today);
+            remainingDays = month.isBefore(current) ? 0 : month.equals(current)
+                    ? month.lengthOfMonth() - today.getDayOfMonth() + 1 : month.lengthOfMonth();
+            dailyBudget = remainingDays == 0 ? 0 : LedgerData.cents(Math.max(0, balance) / remainingDays);
+        }
+    }
+
     /** A dated income or transfer into savings. The history is independent of goal names. */
     static class MoneyEntry {
         final LocalDate date;
@@ -2247,6 +2337,23 @@ public class FinancialTracker extends JFrame {
         double savings(YearMonth month) { return sumEntries(deposits, month); }
         double balance(YearMonth month) {
             return cents(allowance(month) + extraIncome(month) - spent(month, null) - savings(month));
+        }
+
+        boolean hasActivity(YearMonth month) {
+            Map<String, Double> budget = plans.get(month);
+            return allowance(month) > 0 || expenseCount(month) > 0 || extraIncome(month) > 0
+                    || savings(month) > 0 || (budget != null && !budget.isEmpty());
+        }
+
+        /** Prefer the current month; show the latest saved month if it is empty. */
+        YearMonth initialDashboardMonth(YearMonth current) {
+            if (hasActivity(current)) return current;
+            for (YearMonth month : months()) if (hasActivity(month)) return month;
+            return current;
+        }
+
+        DashboardTotals dashboardTotals(YearMonth month, LocalDate today) {
+            return new DashboardTotals(this, month, today);
         }
 
         ArrayList<YearMonth> months() {

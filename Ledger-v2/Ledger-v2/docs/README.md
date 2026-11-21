@@ -73,6 +73,15 @@ deducted from available money. Goals with saved funds cannot be deleted to
 protect their history. Changing a goal name does not rewrite historical
 deposit descriptions.
 
+The Dashboard's **Show month** selector controls all four summary cards and
+the category breakdown together. It initially opens the current month if
+there are records, or the latest saved month containing activity. Adding or
+editing an expense switches to its month and reveals the saved record in the
+Expenses table. Saving an allowance or adding extra income switches the
+Dashboard back to the current month. Press **Save allowance** (or Enter) to
+record the amount; typing alone is not a saved transaction. Historical months
+show a dash for the daily budget because no days remain.
+
 ```text
 Remaining balance = allowance + extra income - expenses - savings deposits
 Daily budget = max(remaining balance, 0) / remaining days (including today)
