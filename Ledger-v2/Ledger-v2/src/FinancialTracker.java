@@ -28,14 +28,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Comparator;
-import java.util.PriorityQueue;
-import java.util.UUID;
-import java.security.SecureRandom;
-import java.security.MessageDigest;
-import javax.crypto.SecretKeyFactory;
-import javax.crypto.spec.PBEKeySpec;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
@@ -49,14 +41,12 @@ import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
-import javax.swing.JCheckBox;
 import javax.swing.JDialog;
 import javax.swing.JFrame;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JProgressBar;
 import javax.swing.JPasswordField;
 import javax.swing.JScrollPane;
 import javax.swing.JSpinner;
@@ -78,7 +68,7 @@ import javax.swing.table.DefaultTableModel;
  * Ledger - a simple student financial tracker.
  *
  * <p>This program was written for a Data Structures class, so the data is kept in
- * real data structures instead of plain variables. The main structures are:</p>
+ * real data structures instead of plain variables. The three used here are:</p>
  *
  * <ul>
  *   <li><b>ArrayList</b> - the list of expenses, the list of goals, the list of
@@ -87,11 +77,11 @@ import javax.swing.table.DefaultTableModel;
  *   <li><b>HashMap</b> - the planned budget. The key is the category name and the
  *       value is the amount planned for that category, so we can look a category
  *       up in one step instead of searching the whole list.</li>
- *   <li><b>Stack</b> - reversible expense additions, edits and deletions.</li>
- *   <li><b>PriorityQueue</b> - upcoming expenses, earliest due date first.</li>
+ *   <li><b>Stack</b> - the recently deleted expenses. When you delete a row it is
+ *       pushed on the stack, and "Undo last delete" pops it back. Last in, first out.</li>
  * </ul>
  *
- * <p>Expense sorting is done with a stable merge sort (see
+ * <p>Sorting is done with a simple bubble sort written by hand (see
  * {@link #sortExpenses(ArrayList, int)}) so the algorithm is visible in the code.</p>
  *
  * <p>The screens are built in the same style Eclipse WindowBuilder uses: the frame
@@ -126,8 +116,12 @@ public class FinancialTracker extends JFrame {
 
     private static final DecimalFormat MONEY = new DecimalFormat("#,##0.00",
             java.text.DecimalFormatSymbols.getInstance(Locale.US));
-    private static final DateTimeFormatter SHORT_DATE =
-            DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.ENGLISH);
+    private static final DateTimeFormatter GOAL_DATE = DateTimeFormatter
+            .ofPattern("MM/dd/uuuu", Locale.US)
+            .withResolverStyle(java.time.format.ResolverStyle.STRICT);
+    private static final DateTimeFormatter MONTH_FORMAT = DateTimeFormatter
+            .ofPattern("MM/uuuu", Locale.US)
+            .withResolverStyle(java.time.format.ResolverStyle.STRICT);
 
     private static final String[] DEFAULT_CATEGORIES = {
         "Food", "Transport", "School", "Load", "Other"
@@ -152,8 +146,8 @@ public class FinancialTracker extends JFrame {
         return data.plan(YearMonth.now());
     }
 
-    /** Stack of reversible expense changes, including adds, edits and deletions. */
-    private final Stack<ExpenseChange> undoHistory = data.undoHistory;
+    /** Stack of deleted expenses, used by "Undo last delete". */
+    private final Stack<Expense> deleted = data.deleted;
 
     /** The expenses currently shown in the table, in table order. */
     private final ArrayList<Expense> shownExpenses = new ArrayList<Expense>();
@@ -226,7 +220,6 @@ public class FinancialTracker extends JFrame {
     private JTable planTable;
     private DefaultTableModel planTableModel;
     private JLabel monthInfoLabel;
-    private JCheckBox rolloverBox;
 
     // Reports (the graph)
     private JPanel categoryBarsPanel;
@@ -274,14 +267,29 @@ public class FinancialTracker extends JFrame {
     /** Builds the main window for the user who just logged in. */
     public FinancialTracker(String username) {
         this.username = username;
-        data.owner = username.toLowerCase(Locale.ROOT);
         dataFile = dataPath(Paths.get(System.getProperty("user.home")), username);
         try {
-            data.load(dataFile);
+            data.load(dataFile, username);
+            if (data.loadedLegacyEdition) {
+                int choice = JOptionPane.showConfirmDialog(null,
+                        "Your saved records are from an earlier Ledger edition.\n"
+                        + "Import them into this version? An exact backup will be made first.\n\n"
+                        + "Expenses, income, allowance, savings and budgets will be retained.\n"
+                        + "Scheduled expenses become ordinary dated expenses; automatic repeats stop.\n"
+                        + "Monthly balances use this version's rules (no automatic carry-over).\n"
+                        + "The original undo history and settings remain in the backup.",
+                        "Import previous Ledger data", JOptionPane.OK_CANCEL_OPTION, JOptionPane.INFORMATION_MESSAGE);
+                if (choice != JOptionPane.OK_OPTION)
+                    throw new IOException("Import cancelled. Your original file is unchanged.");
+                Path backup = data.migrateLegacyEdition(dataFile);
+                JOptionPane.showMessageDialog(null, "Previous records imported.\nOriginal file backed up to:\n" + backup,
+                        "Ledger", JOptionPane.INFORMATION_MESSAGE);
+            }
         } catch (IOException | RuntimeException e) {
-            throw new IllegalStateException("Could not load your Ledger data. The saved file was not changed.", e);
+            throw new IllegalStateException("Could not open your Ledger data. No records were reset.\n"
+                    + "Reason: " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage())
+                    + "\nFile: " + dataFile + "\nKeep this file and any backups; do not delete them.", e);
         }
-        unsaved = data.postDue(LocalDate.now()) > 0;
         dashboardMonth = data.initialDashboardMonth(YearMonth.now());
         expenseMonth = dashboardMonth;
 
@@ -312,14 +320,12 @@ public class FinancialTracker extends JFrame {
                 refreshCurrentMonth();
                 refreshAll();
             }
-            processDueExpenses();
         });
         dateRefreshTimer.start();
         allowanceField.setText(MONEY.format(data.allowance(YearMonth.now())));
         refreshFilterLabel();
         rebuildExpenseTable();
         refreshAll();
-        if (unsaved) saveData();
     }
 
     private static void openTracker(String username) {
@@ -357,57 +363,38 @@ public class FinancialTracker extends JFrame {
         return saved;
     }
 
-    private void manageBackup() {
-        Object[] actions = {"Create backup", "Restore backup", "Cancel"};
-        int choice = JOptionPane.showOptionDialog(this, "Manage your local financial records.",
-                "Backup / restore", JOptionPane.DEFAULT_OPTION, JOptionPane.PLAIN_MESSAGE, null, actions, actions[0]);
-        if (choice != 0 && choice != 1) return;
-        JFileChooser chooser = new JFileChooser();
-        if (choice == 0) {
-            chooser.setSelectedFile(new File("ledger-" + LocalDate.now() + ".properties"));
-            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
-            Path target = chooser.getSelectedFile().toPath();
-            if (target.toAbsolutePath().normalize().equals(dataFile.toAbsolutePath().normalize())) {
-                showError("Choose a different location for your backup.");
-                return;
-            }
-            if (Files.exists(target) && JOptionPane.showConfirmDialog(this, "Replace this existing backup?",
-                    "Backup", JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
-            try {
-                data.save(target);
-                JOptionPane.showMessageDialog(this, "Backup saved: " + target.getFileName());
-            } catch (IOException | RuntimeException e) { showError("Backup failed: " + e.getMessage()); }
-            return;
-        }
-        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+    /** Full reset affects only the signed-in user; a backup is required first. */
+    private void resetAllData() {
+        String answer = JOptionPane.showInputDialog(this,
+                "Reset ALL financial data for " + username + " across every month?\n"
+                + "Expenses, goals, income, allowance, plans, custom categories and undo history will be cleared.\n"
+                + "Your login and other accounts will not change. A backup will be saved first.\n\n"
+                + "Type RESET to confirm:", "Reset all data", JOptionPane.WARNING_MESSAGE);
+        if (!"RESET".equals(answer)) return;
         try {
-            Path source = chooser.getSelectedFile().toPath();
-            if (!Files.isRegularFile(source)) throw new IOException("Backup file not found.");
-            LedgerData candidate = new LedgerData();
-            candidate.owner = data.owner;
-            candidate.load(source); // Validate before changing anything.
-            if (JOptionPane.showConfirmDialog(this, "Restore this backup? Current records will be replaced. "
-                    + "A safety backup will be saved first.", "Restore backup", JOptionPane.YES_NO_OPTION)
-                    != JOptionPane.YES_OPTION) return;
-            Files.createDirectories(dataFile.getParent());
-            Path safety = Files.createTempFile(dataFile.getParent(), "before-restore-", ".properties");
-            data.save(safety);
-            candidate.postDue(LocalDate.now());
-            candidate.save(dataFile);
-            data.replaceWith(candidate);
+            Path backup = data.backupAndReset(dataFile);
             unsaved = false;
+            dashboardMonth = YearMonth.now();
+            activeMonth = dashboardMonth;
             stopEditingExpense();
             stopEditingGoal();
-            dashboardMonth = data.initialDashboardMonth(YearMonth.now());
-            revealExpenseMonth(dashboardMonth.atDay(1));
+            depositField.setText("");
+            allowanceField.setText("0.00");
+            allowanceMessageLabel.setText("Financial data reset.");
+            planAmountField.setText("");
             fillCategoryBox();
-            allowanceField.setText(MONEY.format(data.allowance(YearMonth.now())));
-            rolloverBox.setSelected(data.rolloverEnabled);
+            revealExpenseMonth(LocalDate.now());
+            sortBox.setSelectedIndex(0);
             rebuildExpenseTable();
             refreshAll();
-            JOptionPane.showMessageDialog(this, "Backup restored. Safety copy: " + safety.getFileName());
+            reportMonthBox.setSelectedItem(dashboardMonth.format(MONTH_FORMAT));
+            JOptionPane.showMessageDialog(this, "Financial data reset successfully.\nBackup: " + backup,
+                    "Reset complete", JOptionPane.INFORMATION_MESSAGE);
         } catch (IOException | RuntimeException e) {
-            showError("Restore failed: " + e.getMessage());
+            rebuildExpenseTable();
+            refreshAll();
+            showError("Reset could not be completed. Your financial data has not been intentionally discarded. "
+                    + e.getMessage());
         }
     }
 
@@ -486,9 +473,6 @@ public class FinancialTracker extends JFrame {
         });
 
         right.add(userLabel);
-        JButton dataButton = new JButton("Backup / restore...");
-        dataButton.addActionListener(e -> manageBackup());
-        right.add(dataButton);
         right.add(logoutButton);
 
         header.add(left, BorderLayout.WEST);
@@ -501,8 +485,8 @@ public class FinancialTracker extends JFrame {
         bar.setBackground(CARD);
         bar.setBorder(new MatteBorder(1, 0, 0, 0, BORDER));
 
-        JLabel hint = new JLabel("  ArrayList (records)  -  HashMap (budget)  -  Stack (undo)  -  "
-                + "PriorityQueue (scheduled)  -  File saving");
+        JLabel hint = new JLabel("  ArrayList (records)  -  HashMap (monthly budget)  -  "
+                + "Stack (undo)  -  Automatic local file saving");
         hint.setFont(SMALL_FONT);
         hint.setForeground(MUTED);
         hint.setBorder(new EmptyBorder(6, 8, 6, 8));
@@ -550,11 +534,14 @@ public class FinancialTracker extends JFrame {
         dashboardMonthBox = new JComboBox<String>();
         dashboardMonthBox.addActionListener(e -> {
             if (!fillingDashboardMonths && dashboardMonthBox.getSelectedItem() != null) {
-                dashboardMonth = YearMonth.parse(dashboardMonthBox.getSelectedItem().toString());
+                dashboardMonth = parseFilterMonth(dashboardMonthBox.getSelectedItem().toString());
                 refreshDashboard();
             }
         });
         monthChooser.add(dashboardMonthBox);
+        JButton resetAllButton = new JButton("Reset all data...");
+        resetAllButton.addActionListener(e -> resetAllData());
+        monthChooser.add(resetAllButton);
         summaryHeader.add(monthChooser, BorderLayout.EAST);
 
         summaryArea = new JTextArea();
@@ -625,7 +612,7 @@ public class FinancialTracker extends JFrame {
         fillCategoryBox();
 
         dateSpinner = new JSpinner(expenseDateModel(LocalDate.now()));
-        dateSpinner.setEditor(new JSpinner.DateEditor(dateSpinner, "MMM d, yyyy"));
+        dateSpinner.setEditor(new JSpinner.DateEditor(dateSpinner, "MM/dd/yyyy"));
         ((JSpinner.DateEditor) dateSpinner.getEditor()).getFormat().setLenient(false);
         dateSpinner.setToolTipText("Today or a later date. Past dates cannot be used for new expenses.");
         dateSpinner.setPreferredSize(new Dimension(140, 28));
@@ -697,18 +684,14 @@ public class FinancialTracker extends JFrame {
         buttons.add(addExpenseButton);
         buttons.add(saveExpenseButton);
         buttons.add(cancelExpenseButton);
-        buttons.add(newCategoryButton);
-        JButton recurringButton = new JButton("Repeat monthly...");
-        recurringButton.addActionListener(e -> {
-            if (editingExpense != null) {
-                showError("Finish editing before creating a monthly schedule.");
-                return;
-            }
-            if (JOptionPane.showConfirmDialog(this, "Repeat this expense every month on the selected day?",
-                    "Recurring expense", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION)
-                addExpense(true);
+        JButton clearExpenseButton = new JButton("Clear");
+        clearExpenseButton.addActionListener(e -> {
+            stopEditingExpense();
+            if (categoryBox.getItemCount() > 0) categoryBox.setSelectedIndex(0);
+            descriptionField.requestFocusInWindow();
         });
-        buttons.add(recurringButton);
+        buttons.add(clearExpenseButton);
+        buttons.add(newCategoryButton);
 
         gbc.gridy = 2;
         gbc.gridx = 0;
@@ -780,7 +763,7 @@ public class FinancialTracker extends JFrame {
             }
         });
 
-        undoButton = new JButton("Undo");
+        undoButton = new JButton("Undo delete");
         undoButton.setFont(LABEL_FONT);
         undoButton.setEnabled(false);
         undoButton.addActionListener(new ActionListener() {
@@ -807,9 +790,18 @@ public class FinancialTracker extends JFrame {
         filterButton.addActionListener(e -> showFilters());
         filterInfo = smallLabel("Current month");
         filterRow.add(filterButton);
-        JButton upcomingButton = new JButton("Upcoming...");
-        upcomingButton.addActionListener(e -> showUpcoming());
-        filterRow.add(upcomingButton);
+        JButton clearFilters = new JButton("Clear filters");
+        clearFilters.addActionListener(e -> {
+            expenseMonth = YearMonth.now();
+            expenseFrom = null;
+            expenseTo = null;
+            expenseCategory = null;
+            searchField.setText("");
+            sortBox.setSelectedIndex(0);
+            refreshFilterLabel();
+            rebuildExpenseTable();
+        });
+        filterRow.add(clearFilters);
         filterRow.add(filterInfo);
         JPanel top = new JPanel(new GridLayout(2, 1, 0, 4));
         top.setOpaque(false);
@@ -817,7 +809,7 @@ public class FinancialTracker extends JFrame {
         top.add(filterRow);
 
         expenseTableModel = new DefaultTableModel(new Object[][] {},
-                new String[] {"Date", "Description", "Category", "Amount", "Status"}) {
+                new String[] {"Date", "Description", "Category", "Amount"}) {
             private static final long serialVersionUID = 1L;
 
             public boolean isCellEditable(int row, int column) {
@@ -878,6 +870,7 @@ public class FinancialTracker extends JFrame {
         goalDeadlineField = new JTextField();
         goalDeadlineField.setPreferredSize(new Dimension(120, 28));
         goalDeadlineField.setFont(LABEL_FONT);
+        goalDeadlineField.setToolTipText("Enter MM/DD/YYYY, for example 05/31/2028.");
 
         addGoalButton = new JButton("Add goal");
         addGoalButton.setFont(BOLD_FONT);
@@ -917,7 +910,7 @@ public class FinancialTracker extends JFrame {
         gbc.gridx = 1;
         form.add(smallLabel("TARGET AMOUNT"), gbc);
         gbc.gridx = 2;
-        form.add(smallLabel("SAVE BY (YYYY-MM)"), gbc);
+        form.add(smallLabel("SAVE BY (MM/DD/YYYY)"), gbc);
 
         gbc.gridy = 1;
         gbc.insets = new Insets(0, 0, 8, 12);
@@ -933,6 +926,12 @@ public class FinancialTracker extends JFrame {
         buttons.add(addGoalButton);
         buttons.add(saveGoalButton);
         buttons.add(cancelGoalButton);
+        JButton clearGoalButton = new JButton("Clear");
+        clearGoalButton.addActionListener(e -> {
+            stopEditingGoal();
+            goalNameField.requestFocusInWindow();
+        });
+        buttons.add(clearGoalButton);
 
         gbc.gridy = 2;
         gbc.gridx = 0;
@@ -995,10 +994,18 @@ public class FinancialTracker extends JFrame {
         toolbar.add(smallLabel("ADD MONEY"));
         toolbar.add(depositField);
         toolbar.add(depositButton);
-        toolbar.add(editButton);
-        toolbar.add(deleteButton);
-        toolbar.add(adviceButton);
-        toolbar.add(goalInfoLabel);
+        JButton clearDepositButton = new JButton("Clear amount");
+        clearDepositButton.addActionListener(e -> depositField.setText(""));
+        toolbar.add(clearDepositButton);
+        JPanel goalActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        goalActions.setOpaque(false);
+        goalActions.add(editButton);
+        goalActions.add(deleteButton);
+        JButton resetGoalButton = new JButton("Reset progress...");
+        resetGoalButton.addActionListener(e -> resetGoalProgress());
+        goalActions.add(resetGoalButton);
+        goalActions.add(adviceButton);
+        goalActions.add(goalInfoLabel);
 
         goalTableModel = new DefaultTableModel(new Object[][] {},
                 new String[] {"Goal", "Target", "Saved", "Progress", "Save by"}) {
@@ -1028,7 +1035,11 @@ public class FinancialTracker extends JFrame {
         JScrollPane scroll = new JScrollPane(goalTable);
         scroll.setBorder(new MatteBorder(1, 1, 1, 1, BORDER));
 
-        panel.add(toolbar, BorderLayout.NORTH);
+        JPanel goalTools = new JPanel(new GridLayout(2, 1, 0, 4));
+        goalTools.setOpaque(false);
+        goalTools.add(toolbar);
+        goalTools.add(goalActions);
+        panel.add(goalTools, BorderLayout.NORTH);
         panel.add(scroll, BorderLayout.CENTER);
         return panel;
     }
@@ -1090,21 +1101,31 @@ public class FinancialTracker extends JFrame {
 
         gbc.gridy = 2;
         gbc.gridx = 0;
-        gbc.gridwidth = 2;
-        form.add(allowanceMessageLabel, gbc);
+        gbc.gridwidth = 3;
+        JPanel allowanceActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        allowanceActions.setOpaque(false);
+        JButton clearAllowanceButton = new JButton("Clear input");
+        clearAllowanceButton.addActionListener(e -> {
+            allowanceField.setText("");
+            allowanceMessageLabel.setText("Input cleared; saved allowance unchanged.");
+            allowanceMessageLabel.setForeground(MUTED);
+        });
+        JButton resetAllowanceButton = new JButton("Reset allowance...");
+        resetAllowanceButton.addActionListener(e -> resetAllowance());
+        JButton manageIncomeButton = new JButton("Manage income...");
+        manageIncomeButton.addActionListener(e -> manageIncome());
+        allowanceActions.add(clearAllowanceButton);
+        allowanceActions.add(resetAllowanceButton);
+        allowanceActions.add(manageIncomeButton);
+        form.add(allowanceActions, gbc);
 
         gbc.gridy = 3;
+        gbc.gridx = 0;
+        gbc.gridwidth = 3;
+        form.add(allowanceMessageLabel, gbc);
+
+        gbc.gridy = 4;
         form.add(monthInfoLabel, gbc);
-        gbc.gridx = 2;
-        gbc.gridwidth = 2;
-        rolloverBox = new JCheckBox("Carry unused money into next month", data.rolloverEnabled);
-        rolloverBox.setOpaque(false);
-        rolloverBox.addActionListener(e -> {
-            data.rolloverEnabled = rolloverBox.isSelected();
-            dashboardMonth = YearMonth.now();
-            changed();
-        });
-        form.add(rolloverBox, gbc);
 
         gbc.gridy = 1;
         gbc.gridx = 3;
@@ -1145,7 +1166,7 @@ public class FinancialTracker extends JFrame {
             }
         });
 
-        JButton clearButton = new JButton("Clear plan");
+        JButton clearButton = new JButton("Reset monthly plan...");
         clearButton.setFont(LABEL_FONT);
         clearButton.addActionListener(new ActionListener() {
             public void actionPerformed(ActionEvent e) {
@@ -1158,7 +1179,15 @@ public class FinancialTracker extends JFrame {
         toolbar.add(smallLabel("PLANNED AMOUNT"));
         toolbar.add(planAmountField);
         toolbar.add(setButton);
-        toolbar.add(clearButton);
+        JButton clearPlanInput = new JButton("Clear input");
+        clearPlanInput.addActionListener(e -> planAmountField.setText(""));
+        toolbar.add(clearPlanInput);
+        JPanel planActions = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        planActions.setOpaque(false);
+        JButton deletePlanButton = new JButton("Delete selected plan...");
+        deletePlanButton.addActionListener(e -> deleteSelectedPlan());
+        planActions.add(deletePlanButton);
+        planActions.add(clearButton);
 
         planTableModel = new DefaultTableModel(new Object[][] {},
                 new String[] {"Category", "Planned", "Actual", "Difference"}) {
@@ -1176,11 +1205,24 @@ public class FinancialTracker extends JFrame {
         planTable.setFillsViewportHeight(true);
         planTable.getTableHeader().setFont(BOLD_FONT);
         planTable.getTableHeader().setReorderingAllowed(false);
+        planTable.getSelectionModel().addListSelectionListener(e -> {
+            int row = planTable.getSelectedRow();
+            if (!e.getValueIsAdjusting() && row >= 0) {
+                String category = planTable.getValueAt(row, 0).toString();
+                planCategoryBox.setSelectedItem(category);
+                Double amount = planned().get(category);
+                planAmountField.setText(amount == null ? "" : MONEY.format(amount));
+            }
+        });
 
         JScrollPane scroll = new JScrollPane(planTable);
         scroll.setBorder(new MatteBorder(1, 1, 1, 1, BORDER));
 
-        panel.add(toolbar, BorderLayout.NORTH);
+        JPanel planTools = new JPanel(new GridLayout(2, 1, 0, 4));
+        planTools.setOpaque(false);
+        planTools.add(toolbar);
+        planTools.add(planActions);
+        panel.add(planTools, BorderLayout.NORTH);
         panel.add(scroll, BorderLayout.CENTER);
         fillCategoryBox();
         return panel;
@@ -1196,10 +1238,6 @@ public class FinancialTracker extends JFrame {
     // ------------------------------------------------------------------
 
     private void addExpense() {
-        addExpense(false);
-    }
-
-    private void addExpense(boolean recurring) {
         String description = descriptionField.getText().trim();
         if (description.length() == 0) {
             showError("Please type what you bought.");
@@ -1221,8 +1259,7 @@ public class FinancialTracker extends JFrame {
         LocalDate date = validatedExpenseDate();
         if (date == null) return;
         Expense expense = new Expense(date, description, category, amount);
-        if (recurring) data.scheduleMonthly(expense, LocalDate.now());
-        else data.addExpense(expense, LocalDate.now());
+        expenses.add(expense);
         revealExpenseMonth(expense.date);
 
         descriptionField.setText("");
@@ -1240,10 +1277,6 @@ public class FinancialTracker extends JFrame {
         }
 
         Expense expense = shownExpenses.get(row);
-        if (expense.repeatDay > 0) {
-            showError("Cancel this upcoming recurring schedule and create a new one to change it.");
-            return;
-        }
         editingExpense = expense;
 
         descriptionField.setText(expense.description);
@@ -1273,13 +1306,11 @@ public class FinancialTracker extends JFrame {
 
         LocalDate date = validatedExpenseDate();
         if (date == null) return;
-        Expense old = editingExpense;
-        Expense expense = old.copy();
+        Expense expense = editingExpense;
         expense.description = description;
         expense.amount = amount;
         expense.category = category;
         expense.date = date;
-        data.editExpense(old, expense, LocalDate.now());
         revealExpenseMonth(expense.date);
 
         stopEditingExpense();
@@ -1313,63 +1344,24 @@ public class FinancialTracker extends JFrame {
             return;
         }
 
-        if (expense.repeatDay > 0) data.scheduled.remove(expense);
-        else data.deleteExpense(expense);
+        expenses.remove(expense);
         dashboardMonth = YearMonth.from(expense.date);
+        deleted.push(expense);
         stopEditingExpense();
         rebuildExpenseTable();
         changed();
     }
 
-    /** Reverses the most recent expense change, last in first out. */
+    /** Takes the last deleted expense off the Stack and puts it back. */
     private void undoDelete() {
-        if (undoHistory.isEmpty()) {
+        if (deleted.isEmpty()) {
             return;
         }
-        stopEditingExpense();
-        Expense expense = data.undoExpense(LocalDate.now());
+        Expense expense = deleted.pop();
+        expenses.add(expense);
         revealExpenseMonth(expense.date);
         rebuildExpenseTable();
         changed();
-    }
-
-    private void processDueExpenses() {
-        int posted = data.postDue(LocalDate.now());
-        if (posted > 0) {
-            rebuildExpenseTable();
-            changed();
-        }
-    }
-
-    private void showUpcoming() {
-        ArrayList<Expense> entries = data.upcoming();
-        if (entries.isEmpty()) {
-            JOptionPane.showMessageDialog(this, "No scheduled expenses.", "Upcoming", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-        String[] labels = new String[entries.size()];
-        for (int i = 0; i < entries.size(); i++) {
-            Expense e = entries.get(i);
-            labels[i] = e.date + " | " + e.description + " | ₱" + MONEY.format(e.amount)
-                    + (e.repeatDay > 0 ? " (monthly)" : "");
-        }
-        javax.swing.JList<String> list = new javax.swing.JList<String>(labels);
-        list.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
-        Object[] buttons = {"Close", "Cancel selected schedule"};
-        int choice = JOptionPane.showOptionDialog(this, new JScrollPane(list),
-                "Upcoming expenses (earliest first)", JOptionPane.DEFAULT_OPTION,
-                JOptionPane.INFORMATION_MESSAGE, null, buttons, buttons[0]);
-        if (choice == 1 && list.getSelectedIndex() >= 0) {
-            Expense selected = entries.get(list.getSelectedIndex());
-            if (JOptionPane.showConfirmDialog(this, "Cancel " + selected.description + " and any future repeats?",
-                    "Cancel schedule", JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
-                if (selected.repeatDay > 0) data.scheduled.remove(selected);
-                else if (data.scheduled.contains(selected)) data.deleteExpense(selected);
-                stopEditingExpense();
-                rebuildExpenseTable();
-                changed();
-            }
-        }
     }
 
     /** Show the month of the saved record, even if it differs from today's month. */
@@ -1408,38 +1400,56 @@ public class FinancialTracker extends JFrame {
 
     /** History and optional date/category filtering, without changing the tab layout. */
     private void showFilters() {
-        JTextField month = new JTextField(expenseMonth == null ? "" : expenseMonth.toString());
-        JTextField from = new JTextField(expenseFrom == null ? "" : expenseFrom.toString());
-        JTextField to = new JTextField(expenseTo == null ? "" : expenseTo.toString());
+        JTextField month = new JTextField(expenseMonth == null ? "" : expenseMonth.format(MONTH_FORMAT));
+        JTextField from = new JTextField(expenseFrom == null ? "" : expenseFrom.format(GOAL_DATE));
+        JTextField to = new JTextField(expenseTo == null ? "" : expenseTo.format(GOAL_DATE));
         JComboBox<String> category = new JComboBox<String>();
         category.addItem("All categories");
         for (String name : categories) category.addItem(name);
         if (expenseCategory != null) category.setSelectedItem(expenseCategory);
-        Object[] fields = {"Month (YYYY-MM, blank = all history)", month,
-                "From date (YYYY-MM-DD, optional)", from,
-                "To date (YYYY-MM-DD, optional)", to, "Category", category};
-        if (JOptionPane.showConfirmDialog(this, fields, "Expense filters",
-                JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
-        try {
-            YearMonth m = month.getText().trim().isEmpty() ? null : YearMonth.parse(month.getText().trim());
-            LocalDate f = from.getText().trim().isEmpty() ? null : LocalDate.parse(from.getText().trim());
-            LocalDate t = to.getText().trim().isEmpty() ? null : LocalDate.parse(to.getText().trim());
-            if (f != null && t != null && f.isAfter(t)) throw new IllegalArgumentException();
-            expenseMonth = m;
-            expenseFrom = f;
-            expenseTo = t;
-            expenseCategory = category.getSelectedIndex() == 0 ? null : (String) category.getSelectedItem();
-            refreshFilterLabel();
-            rebuildExpenseTable();
-        } catch (RuntimeException e) {
-            showError("Use valid dates and a start date no later than the end date.");
+        Object[] fields = {"Month (MM/YYYY, blank = all history)", month,
+                "From date (MM/DD/YYYY, optional)", from,
+                "To date (MM/DD/YYYY, optional)", to, "Category", category};
+        while (JOptionPane.showConfirmDialog(this, fields, "Expense filters",
+                JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
+            try {
+                YearMonth m = parseFilterMonth(month.getText().trim());
+                LocalDate f = parseFilterDate(from.getText().trim());
+                LocalDate t = parseFilterDate(to.getText().trim());
+                if (f != null && t != null && f.isAfter(t)) throw new IllegalArgumentException();
+                expenseMonth = m;
+                expenseFrom = f;
+                expenseTo = t;
+                expenseCategory = category.getSelectedIndex() == 0 ? null : (String) category.getSelectedItem();
+                refreshFilterLabel();
+                rebuildExpenseTable();
+                return;
+            } catch (RuntimeException e) {
+                showError("Use MM/YYYY for the month and MM/DD/YYYY for dates.\nThe start date must not be later than the end date.");
+            }
         }
     }
 
+    static YearMonth parseFilterMonth(String input) {
+        if (input.isEmpty()) return null;
+        if (!input.matches("[0-9]{2}/[0-9]{4}")) throw new IllegalArgumentException("Use MM/YYYY");
+        YearMonth result = YearMonth.parse(input, MONTH_FORMAT);
+        if (result.getYear() < 1) throw new IllegalArgumentException("Invalid year");
+        return result;
+    }
+
+    static LocalDate parseFilterDate(String input) {
+        if (input.isEmpty()) return null;
+        if (!input.matches("[0-9]{2}/[0-9]{2}/[0-9]{4}")) throw new IllegalArgumentException("Use MM/DD/YYYY");
+        LocalDate result = LocalDate.parse(input, GOAL_DATE);
+        if (result.getYear() < 1) throw new IllegalArgumentException("Invalid year");
+        return result;
+    }
+
     private void refreshFilterLabel() {
-        filterInfo.setText((expenseMonth == null ? "All months" : expenseMonth.toString())
-                + (expenseFrom == null ? "" : " from " + expenseFrom)
-                + (expenseTo == null ? "" : " to " + expenseTo)
+        filterInfo.setText((expenseMonth == null ? "All months" : expenseMonth.format(MONTH_FORMAT))
+                + (expenseFrom == null ? "" : " from " + expenseFrom.format(GOAL_DATE))
+                + (expenseTo == null ? "" : " to " + expenseTo.format(GOAL_DATE))
                 + (expenseCategory == null ? "" : " | " + expenseCategory));
     }
 
@@ -1460,10 +1470,8 @@ public class FinancialTracker extends JFrame {
         ArrayList<Expense> result = new ArrayList<Expense>();
         String search = searchField == null ? "" : searchField.getText().trim().toLowerCase(Locale.ROOT);
 
-        ArrayList<Expense> all = new ArrayList<Expense>(expenses);
-        all.addAll(data.upcoming());
-        for (int i = 0; i < all.size(); i++) {
-            Expense expense = all.get(i);
+        for (int i = 0; i < expenses.size(); i++) {
+            Expense expense = expenses.get(i);
             if ((expenseMonth == null || YearMonth.from(expense.date).equals(expenseMonth))
                     && (expenseFrom == null || !expense.date.isBefore(expenseFrom))
                     && (expenseTo == null || !expense.date.isAfter(expenseTo))
@@ -1482,11 +1490,10 @@ public class FinancialTracker extends JFrame {
             Expense expense = result.get(i);
             shownExpenses.add(expense);
             expenseTableModel.addRow(new Object[] {
-                expense.date.format(SHORT_DATE),
+                expense.date.format(GOAL_DATE),
                 expense.description,
                 expense.category,
-                "₱" + MONEY.format(expense.amount),
-                data.scheduled.contains(expense) ? (expense.repeatDay > 0 ? "Monthly" : "Scheduled") : "Recorded"
+                "₱" + MONEY.format(expense.amount)
             });
         }
 
@@ -1508,42 +1515,43 @@ public class FinancialTracker extends JFrame {
             return true;
         }
         return expense.date.toString().contains(search)
+                || expense.date.format(GOAL_DATE).contains(search)
                 || String.format(Locale.ROOT, "%.2f", expense.amount).contains(search);
     }
 
     /**
-     * Merge sort. Stable sorting for larger personal transaction histories.
+     * Bubble sort. Simple on purpose: it is the sorting algorithm from the class.
      * mode 0 = newest first, 1 = oldest first, 2 = amount high to low,
      * 3 = amount low to high, 4 = description A-Z.
      */
     static void sortExpenses(ArrayList<Expense> list, int mode) {
-        Expense[] records = list.toArray(new Expense[0]);
-        Expense[] temp = new Expense[records.length];
-        mergeSort(records, temp, 0, records.length, mode);
-        for (int i = 0; i < records.length; i++) list.set(i, records[i]);
-    }
+        for (int i = 0; i < list.size() - 1; i++) {
+            boolean swapped = false;
+            for (int j = 0; j < list.size() - 1 - i; j++) {
+                Expense first = list.get(j);
+                Expense second = list.get(j + 1);
+                boolean swap = false;
 
-    private static int compareExpenses(Expense a, Expense b, int mode) {
-        if (mode == 0) return b.date.compareTo(a.date);
-        if (mode == 1) return a.date.compareTo(b.date);
-        if (mode == 2) return Double.compare(b.amount, a.amount);
-        if (mode == 3) return Double.compare(a.amount, b.amount);
-        return a.description.compareToIgnoreCase(b.description);
-    }
+                if (mode == 0) {
+                    swap = first.date.isBefore(second.date);
+                } else if (mode == 1) {
+                    swap = first.date.isAfter(second.date);
+                } else if (mode == 2) {
+                    swap = first.amount < second.amount;
+                } else if (mode == 3) {
+                    swap = first.amount > second.amount;
+                } else {
+                    swap = first.description.compareToIgnoreCase(second.description) > 0;
+                }
 
-    /** Stable merge sort, O(n log n) comparisons and O(n) temporary storage. */
-    private static void mergeSort(Expense[] values, Expense[] temp, int start, int end, int mode) {
-        if (end - start < 2) return;
-        int middle = start + (end - start) / 2;
-        mergeSort(values, temp, start, middle, mode);
-        mergeSort(values, temp, middle, end, mode);
-        int left = start, right = middle;
-        for (int i = start; i < end; i++) {
-            if (right >= end || (left < middle && compareExpenses(values[left], values[right], mode) <= 0))
-                temp[i] = values[left++];
-            else temp[i] = values[right++];
+                if (swap) {
+                    list.set(j, second);
+                    list.set(j + 1, first);
+                    swapped = true;
+                }
+            }
+            if (!swapped) break;
         }
-        System.arraycopy(temp, start, values, start, end - start);
     }
 
     // ------------------------------------------------------------------
@@ -1563,9 +1571,9 @@ public class FinancialTracker extends JFrame {
             return;
         }
 
-        String deadline = readDeadline(goalDeadlineField.getText().trim());
+        String deadline = readDeadline(goalDeadlineField.getText().trim(), LocalDate.now());
         if (deadline == null) {
-            showError("Please type the deadline as YYYY-MM, for example 2027-03.");
+            showError("Enter a valid deadline as MM/DD/YYYY (today or later).");
             return;
         }
 
@@ -1590,7 +1598,7 @@ public class FinancialTracker extends JFrame {
 
         goalNameField.setText(goal.name);
         goalTargetField.setText(MONEY.format(goal.target));
-        goalDeadlineField.setText(goal.deadline == null ? "" : goal.deadline);
+        goalDeadlineField.setText(goal.deadline == null ? "" : formatDeadline(goal.deadline));
 
         addGoalButton.setVisible(false);
         saveGoalButton.setVisible(true);
@@ -1611,13 +1619,16 @@ public class FinancialTracker extends JFrame {
             return;
         }
 
-        String deadline = readDeadline(goalDeadlineField.getText().trim());
+        Goal goal = goals.get(editingGoal);
+        String entered = goalDeadlineField.getText().trim();
+        String deadline = readDeadline(entered, LocalDate.now());
+        // Existing overdue goals can still be edited without changing their deadline.
+        if (deadline == null && entered.equals(formatDeadline(goal.deadline))) deadline = goal.deadline;
         if (deadline == null) {
-            showError("Please type the deadline as YYYY-MM, for example 2027-03.");
+            showError("Enter a valid deadline as MM/DD/YYYY (today or later).");
             return;
         }
 
-        Goal goal = goals.get(editingGoal);
         if (target < goal.saved) {
             showError("Target cannot be less than the amount already saved.");
             return;
@@ -1649,20 +1660,38 @@ public class FinancialTracker extends JFrame {
         }
 
         Goal goal = goals.get(row);
-        if (goal.saved > 0) {
-            showError("A goal with savings cannot be deleted. This protects your savings history.");
-            return;
-        }
         int answer = JOptionPane.showConfirmDialog(this,
-                "Delete the goal \"" + goal.name + "\"?", "Delete goal",
+                "Delete the goal \"" + goal.name + "\"?"
+                + (goal.saved > 0 ? "\n₱" + MONEY.format(goal.saved)
+                + " will return to this month's available balance. Deposit history is kept." : ""), "Delete goal",
                 JOptionPane.OK_CANCEL_OPTION);
         if (answer != JOptionPane.OK_OPTION) {
             return;
         }
 
+        data.resetGoal(goal, LocalDate.now());
         goals.remove(goal);
+        dashboardMonth = YearMonth.now();
+        depositField.setText("");
         stopEditingGoal();
         rebuildGoalTable();
+        changed();
+    }
+
+    private void resetGoalProgress() {
+        int row = goalTable.getSelectedRow();
+        if (row < 0) { showError("Select a savings goal first."); return; }
+        Goal goal = goals.get(row);
+        if (goal.saved == 0) { showError("This goal already has zero progress."); return; }
+        if (JOptionPane.showConfirmDialog(this,
+                "Reset progress for \"" + goal.name + "\"?\n₱" + MONEY.format(goal.saved)
+                + " will return to this month's available balance.\nThe goal and its deposit history will be kept.",
+                "Reset savings progress", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE)
+                != JOptionPane.OK_OPTION) return;
+        data.resetGoal(goal, LocalDate.now());
+        dashboardMonth = YearMonth.now();
+        depositField.setText("");
+        stopEditingGoal();
         changed();
     }
 
@@ -1711,9 +1740,9 @@ public class FinancialTracker extends JFrame {
         }
         Goal goal = goals.get(row);
         LocalDate today = LocalDate.now();
-        LocalDate deadline = YearMonth.parse(goal.deadline).atEndOfMonth();
+        LocalDate deadline = storedDeadline(goal.deadline);
         double remaining = Math.max(0, goal.target - goal.saved);
-        long days = ChronoUnit.DAYS.between(today, deadline) + 1;
+        long days = daysUntilDeadline(today, deadline);
         String advice = remaining == 0 ? "Goal complete!"
                 : days <= 0 ? "Deadline passed. Update the goal deadline."
                 : "Still needed: ₱" + MONEY.format(remaining)
@@ -1739,7 +1768,7 @@ public class FinancialTracker extends JFrame {
                 "₱" + MONEY.format(goal.target),
                 "₱" + MONEY.format(goal.saved),
                 percent + "%",
-                goal.deadline == null ? "-" : formatMonth(goal.deadline)
+                goal.deadline == null ? "-" : formatDeadline(goal.deadline)
             });
         }
 
@@ -1770,18 +1799,81 @@ public class FinancialTracker extends JFrame {
     }
 
     private void addIncome() {
-        JTextField source = new JTextField();
-        JTextField value = new JTextField();
-        if (JOptionPane.showConfirmDialog(this, new Object[] {"Income source", source, "Amount", value},
-                "Add extra income", JOptionPane.OK_CANCEL_OPTION) != JOptionPane.OK_OPTION) return;
-        double amount = readAmount(value.getText());
-        if (source.getText().trim().isEmpty() || amount <= 0) {
-            showError("Enter a source and a valid positive amount.");
-            return;
-        }
-        data.incomes.add(new MoneyEntry(LocalDate.now(), source.getText().trim(), amount));
+        MoneyEntry entry = incomeForm(null);
+        if (entry == null) return;
+        data.incomes.add(entry);
         dashboardMonth = YearMonth.now();
         changed();
+    }
+
+    private MoneyEntry incomeForm(MoneyEntry existing) {
+        JTextField source = new JTextField(existing == null ? "" : existing.description);
+        JTextField value = new JTextField(existing == null ? "" : MONEY.format(existing.amount));
+        while (true) {
+            int action = JOptionPane.showOptionDialog(this,
+                    new Object[] {"Income source", source, "Amount", value},
+                    existing == null ? "Add extra income" : "Edit income (" + existing.date.format(GOAL_DATE) + ")",
+                    JOptionPane.DEFAULT_OPTION, JOptionPane.PLAIN_MESSAGE, null,
+                    new String[] {"Save", "Clear", "Cancel"}, "Save");
+            if (action == 1) { source.setText(""); value.setText(""); continue; }
+            if (action != 0) return null;
+            double amount = readAmount(value.getText());
+            if (source.getText().trim().isEmpty() || amount <= 0) {
+                showError("Enter a source and a valid positive amount.");
+                continue;
+            }
+            return new MoneyEntry(existing == null ? LocalDate.now() : existing.date,
+                    source.getText().trim(), amount);
+        }
+    }
+
+    private void manageIncome() {
+        while (true) {
+            if (data.incomes.isEmpty()) { showError("There are no saved extra income records."); return; }
+            DefaultTableModel model = new DefaultTableModel(new String[] {"Date", "Source", "Amount"}, 0) {
+                public boolean isCellEditable(int r, int c) { return false; }
+            };
+            for (MoneyEntry entry : data.incomes)
+                model.addRow(new Object[] {entry.date.format(GOAL_DATE), entry.description, "₱" + MONEY.format(entry.amount)});
+            JTable table = new JTable(model);
+            table.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
+            JScrollPane scroll = new JScrollPane(table);
+            scroll.setPreferredSize(new Dimension(510, 200));
+            int action = JOptionPane.showOptionDialog(this, scroll, "Extra income history (all months)",
+                    JOptionPane.DEFAULT_OPTION, JOptionPane.PLAIN_MESSAGE, null,
+                    new String[] {"Edit", "Delete", "Close"}, "Close");
+            if (action < 0 || action > 1) return;
+            int row = table.getSelectedRow();
+            if (row < 0) { showError("Select an income record first."); continue; }
+            MoneyEntry entry = data.incomes.get(row);
+            if (action == 0) {
+                MoneyEntry edited = incomeForm(entry);
+                if (edited == null) continue;
+                data.incomes.set(row, edited);
+            } else {
+                if (JOptionPane.showConfirmDialog(this, "Delete \"" + entry.description + "\" (₱"
+                        + MONEY.format(entry.amount) + ") from " + entry.date.format(GOAL_DATE) + "?\nIts month's balance will be recalculated.",
+                        "Delete extra income", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE)
+                        != JOptionPane.OK_OPTION) continue;
+                data.incomes.remove(row);
+            }
+            dashboardMonth = YearMonth.from(entry.date);
+            changed();
+        }
+    }
+
+    private void resetAllowance() {
+        YearMonth month = YearMonth.now();
+        if (JOptionPane.showConfirmDialog(this, "Set the allowance for " + month.format(MONTH_FORMAT) + " to ₱0.00?\n"
+                + "Expenses, extra income, savings and other months will stay unchanged.",
+                "Reset allowance", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE)
+                != JOptionPane.OK_OPTION) return;
+        data.allowances.remove(month);
+        allowanceField.setText("0.00");
+        dashboardMonth = month;
+        boolean saved = changed();
+        allowanceMessageLabel.setForeground(saved ? GREEN : RED);
+        allowanceMessageLabel.setText(saved ? "Allowance reset." : "Not yet saved to disk.");
     }
 
     private void savePlanForCategory() {
@@ -1805,9 +1897,28 @@ public class FinancialTracker extends JFrame {
     }
 
     private void clearPlan() {
+        if (planned().isEmpty()) { showError("No budget plans for this month."); return; }
+        if (JOptionPane.showConfirmDialog(this, "Delete all category budget plans for " + YearMonth.now().format(MONTH_FORMAT)
+                + "?\nExpenses and other months will stay unchanged.", "Reset monthly plan",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) return;
         planned().clear();
+        planAmountField.setText("");
         dashboardMonth = YearMonth.now();
         rebuildPlanTable();
+        changed();
+    }
+
+    private void deleteSelectedPlan() {
+        int row = planTable.getSelectedRow();
+        if (row < 0) { showError("Select a category row first."); return; }
+        String category = planTable.getValueAt(row, 0).toString();
+        if (!planned().containsKey(category)) { showError("This category has no saved plan."); return; }
+        if (JOptionPane.showConfirmDialog(this, "Delete the " + category + " plan for " + YearMonth.now().format(MONTH_FORMAT)
+                + "?\nIts actual expenses will remain.", "Delete budget plan",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.OK_OPTION) return;
+        planned().remove(category);
+        planAmountField.setText("");
+        dashboardMonth = YearMonth.now();
         changed();
     }
 
@@ -1817,12 +1928,11 @@ public class FinancialTracker extends JFrame {
         }
 
         planTableModel.setRowCount(0);
-        HashMap<String, Double> actuals = data.categoryTotals(YearMonth.now());
         for (int i = 0; i < categories.size(); i++) {
             String category = categories.get(i);
             Double plannedAmount = planned().get(category);
             double plan = plannedAmount == null ? 0 : plannedAmount.doubleValue();
-            double actual = actuals.getOrDefault(category, 0.0);
+            double actual = spentInCategory(category);
 
             String difference;
             if (plan <= 0) {
@@ -1856,7 +1966,7 @@ public class FinancialTracker extends JFrame {
         updateAllowanceInfo();
 
         if (undoButton != null) {
-            undoButton.setEnabled(!undoHistory.isEmpty());
+            undoButton.setEnabled(!deleted.isEmpty());
         }
     }
 
@@ -1867,8 +1977,8 @@ public class FinancialTracker extends JFrame {
         if (!choices.contains(dashboardMonth)) choices.add(dashboardMonth);
         fillingDashboardMonths = true;
         dashboardMonthBox.removeAllItems();
-        for (YearMonth choice : choices) dashboardMonthBox.addItem(choice.toString());
-        dashboardMonthBox.setSelectedItem(dashboardMonth.toString());
+        for (YearMonth choice : choices) dashboardMonthBox.addItem(choice.format(MONTH_FORMAT));
+        dashboardMonthBox.setSelectedItem(dashboardMonth.format(MONTH_FORMAT));
         fillingDashboardMonths = false;
     }
 
@@ -1885,8 +1995,6 @@ public class FinancialTracker extends JFrame {
         double spent = totals.spent;
         double left = totals.balance;
         double perDay = totals.dailyBudget;
-        double carried = data.rollover(month);
-        HashMap<String, Double> categoryTotals = data.categoryTotals(month);
 
         allowanceValueLabel.setText("₱" + MONEY.format(allowance));
         spentValueLabel.setText("₱" + MONEY.format(spent));
@@ -1897,14 +2005,14 @@ public class FinancialTracker extends JFrame {
 
         StringBuilder text = new StringBuilder();
         int count = totals.expenseCount;
-        text.append("Month             : ").append(month).append("\n");
+        text.append("Month             : ").append(month.format(MONTH_FORMAT)).append("\n");
         if (!data.hasActivity(month)) {
             text.append("No saved financial records for this month.\n")
                     .append("Select another month above, or save an allowance / add an expense.\n\n");
         }
         text.append("Extra income      : ₱").append(MONEY.format(extra)).append("\n");
-        text.append("Rollover          : ₱").append(MONEY.format(carried)).append("\n");
         text.append("Savings deposits  : ₱").append(MONEY.format(savings)).append("\n");
+        text.append("Savings returned  : ₱").append(MONEY.format(data.savingsReturned(month))).append("\n");
         text.append("Expenses recorded : ").append(count).append("\n");
         text.append("Total spent      : ₱").append(MONEY.format(spent)).append("\n");
 
@@ -1918,20 +2026,20 @@ public class FinancialTracker extends JFrame {
                     .append(" (₱").append(MONEY.format(biggest.amount)).append(")\n");
         }
 
-        double available = allowance + extra + carried;
-        if (available > 0) {
-            long used = Math.round((spent + savings) / available * 100);
+        double availableFunds = allowance + extra + data.savingsReturned(month);
+        if (availableFunds > 0) {
+            long used = Math.round((spent + savings) / availableFunds * 100);
             text.append("Available funds used: ").append(used).append("%\n");
         }
         if (left < 0) text.append("WARNING: Spending and savings exceed this month's funds.\n");
-        else if (available > 0 && left <= available * 0.1)
+        else if (availableFunds > 0 && left <= availableFunds * 0.1)
             text.append("WARNING: 10% or less of this month's funds remain.\n");
 
         text.append("\nSpending per category\n");
         text.append("---------------------\n");
         for (int i = 0; i < categories.size(); i++) {
             String category = categories.get(i);
-            double amount = categoryTotals.getOrDefault(category, 0.0);
+            double amount = data.spent(month, category);
             if (amount > 0) {
                 text.append(String.format("%-12s ₱%s%n", category, MONEY.format(amount)));
             }
@@ -1948,33 +2056,15 @@ public class FinancialTracker extends JFrame {
                 Double amount = monthPlan.get(category);
                 if (amount != null) {
                     text.append(String.format("%-12s ₱%s%n", category, MONEY.format(amount.doubleValue())));
-                    if (categoryTotals.getOrDefault(category, 0.0) > amount)
+                    if (data.spent(month, category) > amount)
                         text.append("  WARNING: category budget exceeded.\n");
                 }
             }
         }
 
-        if (!undoHistory.isEmpty()) {
-            text.append("\nUndo stack       : ").append(undoHistory.size()).append(" reversible change(s)\n");
+        if (!deleted.isEmpty()) {
+            text.append("\nUndo stack       : ").append(deleted.size()).append(" deleted expense(s)\n");
         }
-        text.append("\nFinancial insights\n---------------------\n");
-        String topCategory = null;
-        double highest = 0;
-        for (String category : categories) {
-            double amount = categoryTotals.getOrDefault(category, 0.0);
-            if (amount > highest) { highest = amount; topCategory = category; }
-        }
-        if (topCategory != null) {
-            text.append("Top spending category: ").append(topCategory)
-                    .append(" (").append(Math.round(highest / spent * 100)).append("% of spending).\n");
-            text.append("Reducing that category by 10% could save ₱")
-                    .append(MONEY.format(highest * 0.1)).append(".\n");
-        }
-        double upcomingAmount = 0;
-        for (Expense e : data.scheduled) if (YearMonth.from(e.date).equals(month)) upcomingAmount += e.amount;
-        text.append("Upcoming expenses this month: ₱").append(MONEY.format(upcomingAmount)).append("\n");
-        if (upcomingAmount > 0) text.append("Projected money left after upcoming expenses: ₱")
-                .append(MONEY.format(left - upcomingAmount)).append("\n");
 
         summaryArea.setText(text.toString());
     }
@@ -2095,6 +2185,8 @@ public class FinancialTracker extends JFrame {
     private void resetExpenseDate() {
         LocalDate today = LocalDate.now();
         configureExpenseDate(today, today);
+        // Discard even an uncommitted date typed directly into the editor.
+        ((JSpinner.DateEditor) dateSpinner.getEditor()).getTextField().setValue(spinnerDate(today));
     }
 
     private void refreshDateFloor() {
@@ -2131,25 +2223,38 @@ public class FinancialTracker extends JFrame {
         }
     }
 
-    /** Checks YYYY-MM and returns it unchanged, or null when it is wrong. */
-    private String readDeadline(String text) {
+    /** Strict MM/DD/YYYY input, saved as an unambiguous ISO date. */
+    static String readDeadline(String text, LocalDate today) {
         try {
-            if (!text.matches("[0-9]{4}-[0-9]{2}")) return null;
-            if (YearMonth.parse(text).isBefore(YearMonth.now())) return null;
-            return text;
+            if (!text.matches("[0-9]{2}/[0-9]{2}/[0-9]{4}")) return null;
+            LocalDate date = LocalDate.parse(text, GOAL_DATE);
+            return date.isBefore(today) ? null : date.toString();
         } catch (Exception e) {
             return null;
         }
     }
 
-    /** "2027-03" becomes "Mar 2027" for the table. */
-    private String formatMonth(String stored) {
-        try {
-            YearMonth month = YearMonth.parse(stored);
-            return month.atDay(1).format(DateTimeFormatter.ofPattern("MMM yyyy", Locale.ENGLISH));
-        } catch (Exception e) {
-            return stored;
-        }
+    /** Old month-only goals keep the final-day deadline used by the previous advice. */
+    static LocalDate storedDeadline(String stored) {
+        if (stored.matches("[0-9]{4}-[0-9]{2}")) return YearMonth.parse(stored).atEndOfMonth();
+        return storedDate(stored);
+    }
+
+    /** Accept ISO storage and valid slash-format dates from older/custom builds. */
+    static LocalDate storedDate(String stored) {
+        return stored.indexOf('/') >= 0 ? parseFilterDate(stored) : LocalDate.parse(stored);
+    }
+
+    static YearMonth storedMonth(String stored) {
+        return stored.indexOf('/') >= 0 ? parseFilterMonth(stored) : YearMonth.parse(stored);
+    }
+
+    static String formatDeadline(String stored) {
+        return storedDeadline(stored).format(GOAL_DATE);
+    }
+
+    static long daysUntilDeadline(LocalDate today, LocalDate deadline) {
+        return ChronoUnit.DAYS.between(today, deadline) + 1;
     }
 
     private void showError(String message) {
@@ -2180,8 +2285,7 @@ public class FinancialTracker extends JFrame {
     // ------------------------------------------------------------------
 
     /**
-     * Two simple bar charts. Each bar is a JProgressBar, so the graph is built
-     * from normal Swing components and there is no drawing code to explain.
+     * Two simple bar charts built from Swing panels.
      */
     private JPanel createReportsPanel() {
         JPanel panel = new JPanel(new BorderLayout(0, 10));
@@ -2214,12 +2318,9 @@ public class FinancialTracker extends JFrame {
         });
         JButton exportButton = new JButton("Export CSV...");
         exportButton.addActionListener(e -> exportReport());
-        JButton yearlyButton = new JButton("Yearly summary...");
-        yearlyButton.addActionListener(e -> showYearlySummary());
         toolbar.add(smallLabel("REPORT MONTH"));
         toolbar.add(reportMonthBox);
         toolbar.add(exportButton);
-        toolbar.add(yearlyButton);
         panel.add(toolbar, BorderLayout.NORTH);
         panel.add(charts, BorderLayout.CENTER);
         panel.add(reportSummaryLabel, BorderLayout.SOUTH);
@@ -2246,7 +2347,7 @@ public class FinancialTracker extends JFrame {
 
     private YearMonth reportMonth() {
         Object selected = reportMonthBox == null ? null : reportMonthBox.getSelectedItem();
-        return selected == null ? YearMonth.now() : YearMonth.parse(selected.toString());
+        return selected == null ? YearMonth.now() : parseFilterMonth(selected.toString());
     }
 
     private void updateReportMonths() {
@@ -2254,9 +2355,9 @@ public class FinancialTracker extends JFrame {
         YearMonth selected = reportMonth();
         fillingReportMonths = true;
         reportMonthBox.removeAllItems();
-        for (YearMonth month : data.months()) reportMonthBox.addItem(month.toString());
-        reportMonthBox.setSelectedItem(selected.toString());
-        if (reportMonthBox.getSelectedItem() == null) reportMonthBox.setSelectedItem(YearMonth.now().toString());
+        for (YearMonth month : data.months()) reportMonthBox.addItem(month.format(MONTH_FORMAT));
+        reportMonthBox.setSelectedItem(selected.format(MONTH_FORMAT));
+        if (reportMonthBox.getSelectedItem() == null) reportMonthBox.setSelectedItem(YearMonth.now().format(MONTH_FORMAT));
         fillingReportMonths = false;
     }
 
@@ -2277,24 +2378,8 @@ public class FinancialTracker extends JFrame {
         }
     }
 
-    private void showYearlySummary() {
-        int year = reportMonth().getYear();
-        double[] totals = data.yearlySpending(year);
-        StringBuilder text = new StringBuilder();
-        double sum = 0;
-        for (int i = 0; i < totals.length; i++) {
-            text.append(String.format("%-10s ₱%,.2f%n",
-                    java.time.Month.of(i + 1).getDisplayName(java.time.format.TextStyle.SHORT, Locale.ENGLISH), totals[i]));
-            sum += totals[i];
-        }
-        text.append("\nTotal: ₱").append(MONEY.format(sum));
-        JTextArea area = new JTextArea(text.toString(), 16, 26);
-        area.setEditable(false);
-        JOptionPane.showMessageDialog(this, new JScrollPane(area), "Yearly spending - " + year, JOptionPane.INFORMATION_MESSAGE);
-    }
-
     /** One bar: a label on the left, the bar in the middle, the amount on the right. */
-    private void addBar(JPanel target, String labelText, double value, double max, String amountText) {
+    private void addBar(JPanel target, String labelText, double value, double max, String amountText, Color color) {
         JPanel row = new JPanel(new BorderLayout(8, 0));
         row.setBackground(CARD);
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
@@ -2305,14 +2390,7 @@ public class FinancialTracker extends JFrame {
         name.setForeground(INK);
         name.setPreferredSize(new Dimension(92, 18));
 
-        JProgressBar bar = new JProgressBar(0, 100);
-        if (max > 0) {
-            bar.setValue((int) Math.round(value / max * 100));
-        }
-        bar.setPreferredSize(new Dimension(120, 14));
-        bar.setForeground(ACCENT);
-        bar.setBackground(new Color(238, 240, 246));
-        bar.setBorderPainted(false);
+        ReportBar bar = new ReportBar(value, max, color);
 
         JLabel amount = new JLabel(amountText);
         amount.setFont(SMALL_FONT);
@@ -2324,6 +2402,41 @@ public class FinancialTracker extends JFrame {
         row.add(bar, BorderLayout.CENTER);
         row.add(amount, BorderLayout.EAST);
         target.add(row);
+    }
+
+    /** Stable color by category's saved ArrayList position, not its sorted rank. */
+    private static final Color[] CATEGORY_COLORS = {
+        new Color(22, 163, 74), new Color(37, 99, 235), new Color(234, 88, 12),
+        new Color(124, 58, 237), new Color(13, 148, 136), new Color(190, 24, 93),
+        new Color(161, 98, 7), new Color(8, 145, 178), new Color(220, 38, 38),
+        new Color(71, 85, 105)
+    };
+
+    static Color categoryColor(int index) {
+        if (index < 0) return ACCENT;
+        if (index < CATEGORY_COLORS.length) return CATEGORY_COLORS[index];
+        // Custom categories beyond the palette get a new hue automatically.
+        return Color.getHSBColor((float) ((index * 0.61803398875) % 1), 0.78f, 0.75f);
+    }
+
+    /** Draw the actual color rather than letting Nimbus override a progress bar. */
+    static class ReportBar extends JPanel {
+        private final double fraction;
+        private final Color color;
+
+        ReportBar(double value, double max, Color color) {
+            this.fraction = max <= 0 ? 0 : Math.max(0, Math.min(1, value / max));
+            this.color = color;
+            setBackground(new Color(238, 240, 246));
+            setOpaque(true);
+            setPreferredSize(new Dimension(120, 14));
+        }
+
+        @Override protected void paintComponent(java.awt.Graphics g) {
+            super.paintComponent(g);
+            g.setColor(color);
+            if (fraction > 0) g.fillRect(0, 0, Math.max(1, (int) Math.round(getWidth() * fraction)), getHeight());
+        }
     }
 
     private JLabel chartNote(String text) {
@@ -2355,7 +2468,7 @@ public class FinancialTracker extends JFrame {
             for (int i = 0; i < byCategory.size(); i++) {
                 Slice slice = byCategory.get(i);
                 addBar(categoryBarsPanel, slice.name, slice.amount, maxCategory,
-                        "\u20b1" + MONEY.format(slice.amount));
+                        "\u20b1" + MONEY.format(slice.amount), categoryColor(categories.indexOf(slice.name)));
             }
         }
 
@@ -2367,14 +2480,14 @@ public class FinancialTracker extends JFrame {
         for (int i = 0; i < byDay.size(); i++) {
             Slice slice = byDay.get(i);
             addBar(dailyBarsPanel, slice.name, slice.amount, maxDay,
-                    slice.amount > 0 ? "\u20b1" + MONEY.format(slice.amount) : "-");
+                    slice.amount > 0 ? "\u20b1" + MONEY.format(slice.amount) : "-", ACCENT);
         }
 
         double total = data.spent(month, null);
-        reportSummaryLabel.setText("<html>" + month + " | Income: ₱" + MONEY.format(data.allowance(month) + data.extraIncome(month))
-                + (data.rolloverEnabled ? " | Carry: ₱" + MONEY.format(data.rollover(month)) : "")
+        reportSummaryLabel.setText("<html>" + month.format(MONTH_FORMAT) + " | Income: ₱" + MONEY.format(data.allowance(month) + data.extraIncome(month))
                 + " | Expenses: ₱" + MONEY.format(total)
                 + " | Savings: ₱" + MONEY.format(data.savings(month))
+                + " | Savings returned: ₱" + MONEY.format(data.savingsReturned(month))
                 + " | Balance: ₱" + MONEY.format(data.balance(month)) + "</html>");
 
         categoryBarsPanel.revalidate();
@@ -2397,9 +2510,8 @@ public class FinancialTracker extends JFrame {
     /** Totals per category, biggest first (bubble sort again). */
     private ArrayList<Slice> sortedCategoryTotals(YearMonth month) {
         ArrayList<Slice> list = new ArrayList<Slice>();
-        HashMap<String, Double> totals = data.categoryTotals(month);
         for (int i = 0; i < categories.size(); i++) {
-            double amount = totals.getOrDefault(categories.get(i), 0.0);
+            double amount = data.spent(month, categories.get(i));
             if (amount > 0) {
                 list.add(new Slice(categories.get(i), amount));
             }
@@ -2419,7 +2531,6 @@ public class FinancialTracker extends JFrame {
     /** Totals for each day of the selected month, oldest first. */
     private ArrayList<Slice> dailyTotals(YearMonth month) {
         ArrayList<Slice> list = new ArrayList<Slice>();
-        DateTimeFormatter format = DateTimeFormatter.ofPattern("MMM d", Locale.ENGLISH);
 
         for (int i = 1; i <= month.lengthOfMonth(); i++) {
             LocalDate day = month.atDay(i);
@@ -2429,7 +2540,7 @@ public class FinancialTracker extends JFrame {
                     total = total + expenses.get(j).amount;
                 }
             }
-            list.add(new Slice(day.format(format), total));
+            list.add(new Slice(day.format(GOAL_DATE), total));
         }
         return list;
     }
@@ -2475,35 +2586,20 @@ public class FinancialTracker extends JFrame {
      * No database, external library or Java object serialization is needed.
      */
     static class LedgerData {
-        String owner = "";
+        boolean loadedLegacyEdition;
         final ArrayList<Expense> expenses = new ArrayList<Expense>();
         final ArrayList<Goal> goals = new ArrayList<Goal>();
         final ArrayList<String> categories = new ArrayList<String>();
-        final Stack<ExpenseChange> undoHistory = new Stack<ExpenseChange>();
-        final PriorityQueue<Expense> scheduled = new PriorityQueue<Expense>(
-                Comparator.comparing((Expense e) -> e.date).thenComparing(e -> e.id));
-        boolean rolloverEnabled;
+        final Stack<Expense> deleted = new Stack<Expense>();
         final ArrayList<MoneyEntry> incomes = new ArrayList<MoneyEntry>();
         final ArrayList<MoneyEntry> deposits = new ArrayList<MoneyEntry>();
+        final ArrayList<MoneyEntry> savingsReturns = new ArrayList<MoneyEntry>();
         final HashMap<YearMonth, Double> allowances = new HashMap<YearMonth, Double>();
         final HashMap<YearMonth, HashMap<String, Double>> plans =
                 new HashMap<YearMonth, HashMap<String, Double>>();
 
         LedgerData() {
             Collections.addAll(categories, DEFAULT_CATEGORIES);
-        }
-
-        void replaceWith(LedgerData source) {
-            expenses.clear(); expenses.addAll(source.expenses);
-            goals.clear(); goals.addAll(source.goals);
-            categories.clear(); categories.addAll(source.categories);
-            undoHistory.clear(); undoHistory.addAll(source.undoHistory);
-            scheduled.clear(); scheduled.addAll(source.scheduled);
-            incomes.clear(); incomes.addAll(source.incomes);
-            deposits.clear(); deposits.addAll(source.deposits);
-            allowances.clear(); allowances.putAll(source.allowances);
-            plans.clear(); plans.putAll(source.plans);
-            rolloverEnabled = source.rolloverEnabled;
         }
 
         HashMap<String, Double> plan(YearMonth month) {
@@ -2513,89 +2609,6 @@ public class FinancialTracker extends JFrame {
 
         double allowance(YearMonth month) {
             return allowances.getOrDefault(month, 0.0);
-        }
-
-        /** Single traversal builds the HashMap used by charts and budget summaries. */
-        HashMap<String, Double> categoryTotals(YearMonth month) {
-            HashMap<String, Double> totals = new HashMap<String, Double>();
-            for (Expense e : expenses) if (YearMonth.from(e.date).equals(month))
-                totals.put(e.category, cents(totals.getOrDefault(e.category, 0.0) + e.amount));
-            return totals;
-        }
-
-        /** Twelve array slots correspond to January through December. */
-        double[] yearlySpending(int year) {
-            double[] totals = new double[12];
-            for (Expense e : expenses) if (e.date.getYear() == year)
-                totals[e.date.getMonthValue() - 1] += e.amount;
-            for (int i = 0; i < totals.length; i++) totals[i] = cents(totals[i]);
-            return totals;
-        }
-
-        private void place(Expense expense, LocalDate today) {
-            if (expense.date.isAfter(today)) scheduled.add(expense);
-            else expenses.add(expense);
-        }
-
-        private void removeById(String id) {
-            expenses.removeIf(e -> e.id.equals(id));
-            scheduled.removeIf(e -> e.id.equals(id));
-        }
-
-        void addExpense(Expense expense, LocalDate today) {
-            place(expense, today);
-            undoHistory.push(new ExpenseChange(null, expense.copy()));
-        }
-
-        void editExpense(Expense old, Expense replacement, LocalDate today) {
-            undoHistory.push(new ExpenseChange(old.copy(), replacement.copy()));
-            removeById(old.id);
-            place(replacement, today);
-        }
-
-        void deleteExpense(Expense expense) {
-            undoHistory.push(new ExpenseChange(expense.copy(), null));
-            removeById(expense.id);
-        }
-
-        Expense undoExpense(LocalDate today) {
-            if (undoHistory.empty()) return null;
-            ExpenseChange action = undoHistory.pop();
-            if (action.after != null) removeById(action.after.id);
-            if (action.before != null) place(action.before.copy(), today);
-            return action.before == null ? action.after : action.before;
-        }
-
-        void scheduleMonthly(Expense template, LocalDate today) {
-            template.repeatDay = template.date.getDayOfMonth();
-            scheduled.add(template);
-            postDue(today);
-        }
-
-        /** Poll due dates first; monthly schedules keep their original day-of-month. */
-        int postDue(LocalDate today) {
-            int posted = 0;
-            while (!scheduled.isEmpty() && !scheduled.peek().date.isAfter(today)) {
-                Expense due = scheduled.poll();
-                if (due.repeatDay > 0) {
-                    YearMonth next = YearMonth.from(due.date).plusMonths(1);
-                    Expense following = new Expense(next.atDay(Math.min(due.repeatDay, next.lengthOfMonth())),
-                            due.description, due.category, due.amount);
-                    following.repeatDay = due.repeatDay;
-                    scheduled.add(following);
-                }
-                due.repeatDay = 0;
-                expenses.add(due);
-                posted++;
-            }
-            return posted;
-        }
-
-        ArrayList<Expense> upcoming() {
-            PriorityQueue<Expense> copy = new PriorityQueue<Expense>(scheduled);
-            ArrayList<Expense> result = new ArrayList<Expense>();
-            while (!copy.isEmpty()) result.add(copy.poll());
-            return result;
         }
 
         static double cents(double amount) {
@@ -2627,35 +2640,46 @@ public class FinancialTracker extends JFrame {
 
         double extraIncome(YearMonth month) { return sumEntries(incomes, month); }
         double savings(YearMonth month) { return sumEntries(deposits, month); }
+        double savingsReturned(YearMonth month) { return sumEntries(savingsReturns, month); }
         double balance(YearMonth month) {
-            return cents(allowance(month) + extraIncome(month) + rollover(month)
-                    - spent(month, null) - savings(month));
+            return cents(allowance(month) + extraIncome(month) - spent(month, null) - savings(month)
+                    + savingsReturned(month));
         }
 
-        /** Carry positive closing balances forward; do not carry a deficit. */
-        double rollover(YearMonth month) {
-            if (!rolloverEnabled) return 0;
-            HashMap<YearMonth, Double> net = new HashMap<YearMonth, Double>(allowances);
-            for (MoneyEntry e : incomes) addNet(net, YearMonth.from(e.date), e.amount);
-            for (MoneyEntry e : deposits) addNet(net, YearMonth.from(e.date), -e.amount);
-            for (Expense e : expenses) addNet(net, YearMonth.from(e.date), -e.amount);
-            ArrayList<YearMonth> earlier = new ArrayList<YearMonth>(net.keySet());
-            Collections.sort(earlier);
-            double carry = 0;
-            for (YearMonth m : earlier) {
-                if (m.isBefore(month)) carry = Math.max(0, cents(carry + net.get(m)));
+        /** Return saved money on reset/delete without rewriting old monthly records. */
+        void resetGoal(Goal goal, LocalDate date) {
+            if (goal.saved > 0) {
+                savingsReturns.add(new MoneyEntry(date, goal.name, goal.saved));
+                goal.saved = 0;
             }
-            return carry;
         }
 
-        private static void addNet(HashMap<YearMonth, Double> net, YearMonth month, double amount) {
-            net.put(month, cents(net.getOrDefault(month, 0.0) + amount));
+        void resetFinances() {
+            expenses.clear(); goals.clear(); categories.clear(); deleted.clear();
+            incomes.clear(); deposits.clear(); savingsReturns.clear(); allowances.clear(); plans.clear();
+            Collections.addAll(categories, DEFAULT_CATEGORIES);
+        }
+
+        /** Snapshot the current state first, then commit the empty state atomically. */
+        Path backupAndReset(Path file) throws IOException {
+            Path backupDir = file.toAbsolutePath().getParent().resolve("backups");
+            Files.createDirectories(backupDir);
+            Path backup = Files.createTempFile(backupDir, file.getFileName().toString() + "-before-reset-", ".properties");
+            save(backup);
+            resetFinances();
+            try {
+                save(file);
+            } catch (IOException | RuntimeException e) {
+                load(backup);
+                throw e;
+            }
+            return backup;
         }
 
         boolean hasActivity(YearMonth month) {
             Map<String, Double> budget = plans.get(month);
-            return allowance(month) > 0 || rollover(month) > 0 || expenseCount(month) > 0 || extraIncome(month) > 0
-                    || savings(month) > 0 || (budget != null && !budget.isEmpty());
+            return allowance(month) > 0 || expenseCount(month) > 0 || extraIncome(month) > 0
+                    || savings(month) > 0 || savingsReturned(month) > 0 || (budget != null && !budget.isEmpty());
         }
 
         /** Prefer the current month; show the latest saved month if it is empty. */
@@ -2675,9 +2699,9 @@ public class FinancialTracker extends JFrame {
             for (YearMonth m : allowances.keySet()) addMonth(result, m);
             for (YearMonth m : plans.keySet()) addMonth(result, m);
             for (Expense e : expenses) addMonth(result, YearMonth.from(e.date));
-            for (Expense e : scheduled) addMonth(result, YearMonth.from(e.date));
             for (MoneyEntry e : incomes) addMonth(result, YearMonth.from(e.date));
             for (MoneyEntry e : deposits) addMonth(result, YearMonth.from(e.date));
+            for (MoneyEntry e : savingsReturns) addMonth(result, YearMonth.from(e.date));
             // Bubble sort the month list, newest first.
             for (int i = 0; i < result.size() - 1; i++)
                 for (int j = 0; j < result.size() - 1 - i; j++)
@@ -2711,21 +2735,11 @@ public class FinancialTracker extends JFrame {
         private static void writeExpenses(Properties p, String prefix, java.util.List<Expense> list) {
             put(p, prefix + ".count", list.size());
             for (int i = 0; i < list.size(); i++) {
-                writeExpense(p, prefix + "." + i + ".", list.get(i));
+                Expense e = list.get(i);
+                String k = prefix + "." + i + ".";
+                put(p, k + "date", e.date); put(p, k + "description", e.description);
+                put(p, k + "category", e.category); put(p, k + "amount", e.amount);
             }
-        }
-        private static void writeExpense(Properties p, String k, Expense e) {
-            put(p, k + "date", e.date); put(p, k + "description", e.description);
-            put(p, k + "category", e.category); put(p, k + "amount", e.amount);
-            put(p, k + "id", e.id); put(p, k + "repeat", e.repeatDay);
-        }
-        private static Expense readExpense(Properties p, String k) throws IOException {
-            Expense e = new Expense(LocalDate.parse(required(p, k + "date")),
-                    required(p, k + "description"), required(p, k + "category"), amount(p, k + "amount"));
-            e.id = p.getProperty(k + "id", e.id);
-            e.repeatDay = Integer.parseInt(p.getProperty(k + "repeat", "0"));
-            if (e.repeatDay < 0 || e.repeatDay > 31) throw new IOException("Invalid recurrence.");
-            return e;
         }
         private static void readExpenses(Properties p, String prefix, java.util.List<Expense> list)
                 throws IOException {
@@ -2734,6 +2748,11 @@ public class FinancialTracker extends JFrame {
                 String k = prefix + "." + i + ".";
                 list.add(readExpense(p, k));
             }
+        }
+
+        private static Expense readExpense(Properties p, String k) throws IOException {
+            return new Expense(storedDate(required(p, k + "date")),
+                    required(p, k + "description"), required(p, k + "category"), amount(p, k + "amount"));
         }
         private static void writeEntries(Properties p, String prefix, ArrayList<MoneyEntry> list) {
             put(p, prefix + ".count", list.size());
@@ -2749,27 +2768,19 @@ public class FinancialTracker extends JFrame {
             int n = count(p, prefix + ".count");
             for (int i = 0; i < n; i++) {
                 String k = prefix + "." + i + ".";
-                list.add(new MoneyEntry(LocalDate.parse(required(p, k + "date")),
+                list.add(new MoneyEntry(storedDate(required(p, k + "date")),
                         required(p, k + "description"), amount(p, k + "amount")));
             }
         }
 
         void save(Path file) throws IOException {
             Properties p = new Properties();
-            put(p, "version", 2);
-            put(p, "owner", owner);
-            put(p, "rollover", rolloverEnabled);
+            put(p, "version", 1);
             writeExpenses(p, "expense", expenses);
-            writeExpenses(p, "scheduled", upcoming());
-            put(p, "change.count", undoHistory.size());
-            for (int i = 0; i < undoHistory.size(); i++) {
-                ExpenseChange c = undoHistory.get(i);
-                String k = "change." + i + ".";
-                if (c.before != null) writeExpense(p, k + "before.", c.before);
-                if (c.after != null) writeExpense(p, k + "after.", c.after);
-            }
+            writeExpenses(p, "undo", deleted);
             writeEntries(p, "income", incomes);
             writeEntries(p, "deposit", deposits);
+            writeEntries(p, "savingsReturn", savingsReturns);
             put(p, "category.count", categories.size());
             for (int i = 0; i < categories.size(); i++) put(p, "category." + i, categories.get(i));
             put(p, "goal.count", goals.size());
@@ -2809,58 +2820,51 @@ public class FinancialTracker extends JFrame {
             }
         }
 
-        void load(Path file) throws IOException {
+        void load(Path file) throws IOException { load(file, ""); }
+
+        void load(Path file, String username) throws IOException {
             if (Files.notExists(file)) return;
             Properties p = new Properties();
             try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
                 p.load(reader);
             }
             String version = required(p, "version");
-            if (!"1".equals(version) && !"2".equals(version)) throw new IOException("Unknown data version.");
-            String savedOwner = p.getProperty("owner", "");
-            if (!owner.isEmpty() && !savedOwner.isEmpty() && !owner.equals(savedOwner))
-                throw new IOException("This file belongs to another ledger account.");
-            expenses.clear(); undoHistory.clear(); scheduled.clear(); incomes.clear(); deposits.clear();
+            if (!"1".equals(version) && !"2".equals(version)) throw new IOException("Unsupported data version: " + version);
+            String owner = p.getProperty("owner", "");
+            if (!username.isEmpty() && !owner.isEmpty() && !owner.equalsIgnoreCase(username))
+                throw new IOException("The saved file belongs to another account.");
+            loadedLegacyEdition = "2".equals(version);
+            expenses.clear(); deleted.clear(); incomes.clear(); deposits.clear(); savingsReturns.clear();
             categories.clear(); goals.clear(); allowances.clear(); plans.clear();
-            rolloverEnabled = Boolean.parseBoolean(p.getProperty("rollover", "false"));
             readExpenses(p, "expense", expenses);
-            if ("1".equals(version)) {
-                // Earlier versions recorded future dates immediately. Keep each record,
-                // but classify it as upcoming until its date arrives.
-                ArrayList<Expense> future = new ArrayList<Expense>();
-                for (Expense e : expenses) if (e.date.isAfter(LocalDate.now())) future.add(e);
-                expenses.removeAll(future);
-                scheduled.addAll(future);
-                ArrayList<Expense> legacyDeleted = new ArrayList<Expense>();
-                readExpenses(p, "undo", legacyDeleted);
-                for (Expense e : legacyDeleted) undoHistory.push(new ExpenseChange(e, null));
-            } else {
-                ArrayList<Expense> queued = new ArrayList<Expense>();
-                readExpenses(p, "scheduled", queued);
-                scheduled.addAll(queued);
+            if (loadedLegacyEdition) {
+                // The simpler Ledger has no schedules; preserve each dated record.
+                readExpenses(p, "scheduled", expenses);
                 int changes = count(p, "change.count");
                 for (int i = 0; i < changes; i++) {
                     String k = "change." + i + ".";
-                    Expense before = p.containsKey(k + "before.date") ? readExpense(p, k + "before.") : null;
-                    Expense after = p.containsKey(k + "after.date") ? readExpense(p, k + "after.") : null;
-                    if (before == null && after == null) throw new IOException("Invalid undo record.");
-                    undoHistory.push(new ExpenseChange(before, after));
+                    boolean before = p.containsKey(k + "before.date");
+                    boolean after = p.containsKey(k + "after.date");
+                    if (!before && !after) throw new IOException("Invalid undo record: " + k);
+                    if (before && !after) deleted.push(readExpense(p, k + "before."));
                 }
-            }
+            } else readExpenses(p, "undo", deleted);
             readEntries(p, "income", incomes); readEntries(p, "deposit", deposits);
+            // Older Ledger files lack this optional list and remain readable.
+            if (p.containsKey("savingsReturn.count")) readEntries(p, "savingsReturn", savingsReturns);
             int n = count(p, "category.count");
             for (int i = 0; i < n; i++) categories.add(required(p, "category." + i));
             n = count(p, "goal.count");
             for (int i = 0; i < n; i++) {
                 String k = "goal." + i + ".";
-                String deadline = YearMonth.parse(required(p, k + "deadline")).toString();
+                String deadline = storedDeadline(required(p, k + "deadline")).toString();
                 goals.add(new Goal(required(p, k + "name"), amount(p, k + "target"),
                         amount(p, k + "saved"), deadline));
             }
             n = count(p, "month.count");
             for (int i = 0; i < n; i++) {
                 String k = "month." + i + ".";
-                YearMonth m = YearMonth.parse(required(p, k + "date"));
+                YearMonth m = storedMonth(required(p, k + "date"));
                 allowances.put(m, amount(p, k + "allowance"));
                 int size = count(p, k + "plan.count");
                 for (int j = 0; j < size; j++) {
@@ -2868,6 +2872,18 @@ public class FinancialTracker extends JFrame {
                     plan(m).put(required(p, b + "category"), amount(p, b + "amount"));
                 }
             }
+        }
+
+        /** Never replace a legacy file without first saving its exact bytes. */
+        Path migrateLegacyEdition(Path file) throws IOException {
+            if (!loadedLegacyEdition) throw new IOException("No old-edition data to import.");
+            Path backupDir = file.toAbsolutePath().getParent().resolve("backups");
+            Files.createDirectories(backupDir);
+            Path backup = Files.createTempFile(backupDir, file.getFileName().toString() + "-before-import-", ".properties");
+            Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
+            save(file);
+            loadedLegacyEdition = false;
+            return backup;
         }
 
         private static String csv(String value) {
@@ -2882,13 +2898,14 @@ public class FinancialTracker extends JFrame {
             try (Writer out = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
                 out.write("\uFEFFDate,Type,Description,Category,Amount\r\n");
                 out.write(month.atDay(1) + ",Allowance,Monthly allowance,," + moneyNumber(allowance(month)) + "\r\n");
-                if (rolloverEnabled) out.write(month.atDay(1) + ",Rollover,Previous month balance,," + moneyNumber(rollover(month)) + "\r\n");
                 for (MoneyEntry e : incomes) if (YearMonth.from(e.date).equals(month))
                     out.write(e.date + ",Income," + csv(e.description) + ",," + moneyNumber(e.amount) + "\r\n");
                 for (Expense e : expenses) if (YearMonth.from(e.date).equals(month))
                     out.write(e.date + ",Expense," + csv(e.description) + "," + csv(e.category) + "," + moneyNumber(e.amount) + "\r\n");
                 for (MoneyEntry e : deposits) if (YearMonth.from(e.date).equals(month))
                     out.write(e.date + ",Savings," + csv(e.description) + ",," + moneyNumber(e.amount) + "\r\n");
+                for (MoneyEntry e : savingsReturns) if (YearMonth.from(e.date).equals(month))
+                    out.write(e.date + ",Savings return," + csv(e.description) + ",," + moneyNumber(e.amount) + "\r\n");
                 out.write(",Summary,Remaining balance,," + moneyNumber(balance(month)) + "\r\n");
             }
         }
@@ -2896,8 +2913,6 @@ public class FinancialTracker extends JFrame {
 
     /** One expense row. */
     static class Expense {
-        String id = UUID.randomUUID().toString();
-        int repeatDay;
         LocalDate date;
         String description;
         String category;
@@ -2909,18 +2924,6 @@ public class FinancialTracker extends JFrame {
             this.category = category;
             this.amount = amount;
         }
-
-        Expense copy() {
-            Expense copy = new Expense(date, description, category, amount);
-            copy.id = id;
-            copy.repeatDay = repeatDay;
-            return copy;
-        }
-    }
-
-    static class ExpenseChange {
-        final Expense before, after;
-        ExpenseChange(Expense before, Expense after) { this.before = before; this.after = after; }
     }
 
     /** One savings goal. */
@@ -2934,55 +2937,37 @@ public class FinancialTracker extends JFrame {
             this.name = name;
             this.target = target;
             this.saved = saved;
-            this.deadline = deadline;
+            this.deadline = storedDeadline(deadline).toString();
         }
     }
 
     /** One user account for the login window. */
     static class User {
         String username;
-        String passwordHash;
+        String password;
 
         User(String username, String password) {
             this.username = username;
-            this.passwordHash = hashPassword(password);
+            this.password = password;
         }
 
-        private User(String username, String stored, boolean alreadyHashed) {
-            this.username = username;
-            this.passwordHash = stored;
-            if (!stored.startsWith("pbkdf2$")) throw new IllegalArgumentException("Invalid password record.");
-        }
-
-        static User fromStored(String username, String stored) { return new User(username, stored, true); }
-
-        boolean verify(String password) {
+        /** Previous editions stored PBKDF2 hashes; do not mistake a hash for a password. */
+        boolean verify(String candidate) {
+            if (!password.startsWith("pbkdf2$")) return password.equals(candidate);
             try {
-                String[] parts = passwordHash.split("\\$", -1);
-                if (parts.length != 4 || !"pbkdf2".equals(parts[0])) return false;
+                String[] parts = password.split("\\$", -1);
+                if (parts.length != 4) return false;
                 int rounds = Integer.parseInt(parts[1]);
                 if (rounds < 100000 || rounds > 2000000) return false;
-                byte[] salt = Base64.getDecoder().decode(parts[2]);
-                byte[] expected = Base64.getDecoder().decode(parts[3]);
-                return MessageDigest.isEqual(expected, derive(password, salt, rounds));
-            } catch (RuntimeException e) { return false; }
-        }
-
-        private static String hashPassword(String password) {
-            int rounds = 600000;
-            byte[] salt = new byte[16];
-            new SecureRandom().nextBytes(salt);
-            return "pbkdf2$" + rounds + "$" + Base64.getEncoder().encodeToString(salt)
-                    + "$" + Base64.getEncoder().encodeToString(derive(password, salt, rounds));
-        }
-
-        private static byte[] derive(String password, byte[] salt, int rounds) {
-            PBEKeySpec spec = new PBEKeySpec(password.toCharArray(), salt, rounds, 256);
-            try {
-                return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
-            } catch (java.security.GeneralSecurityException e) {
-                throw new IllegalStateException("Password hashing is unavailable in this Java installation.", e);
-            } finally { spec.clearPassword(); }
+                byte[] salt = java.util.Base64.getDecoder().decode(parts[2]);
+                byte[] expected = java.util.Base64.getDecoder().decode(parts[3]);
+                if (salt.length < 8 || expected.length != 32) return false;
+                javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(candidate.toCharArray(), salt, rounds, 256);
+                try {
+                    byte[] actual = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+                    return java.security.MessageDigest.isEqual(expected, actual);
+                } finally { spec.clearPassword(); }
+            } catch (java.security.GeneralSecurityException | RuntimeException e) { return false; }
         }
     }
 }
@@ -2992,8 +2977,8 @@ public class FinancialTracker extends JFrame {
  * WindowBuilder form with fixed coordinates looks.
  *
  * <p>Accounts are kept in an ArrayList and copied to {@code users.txt} so a new
- * account is still there the next time the program runs. Passwords use salted
- * PBKDF2 hashes rather than plain text.</p>
+ * account is still there the next time the program runs. A real application would
+ * store a hashed password instead of plain text.</p>
  */
 class LoginDialog extends JDialog {
 
@@ -3149,8 +3134,8 @@ class LoginDialog extends JDialog {
             showMessage("Use 3-32 letters, numbers, dots, _ or -.");
             return;
         }
-        if (pass.length() < 8 || !pass.equals(pass.trim()) || pass.contains("\n") || pass.contains("\r")) {
-            showMessage("Use 8+ characters without outer spaces.");
+        if (pass.length() < 4 || !pass.equals(pass.trim()) || pass.contains("\n") || pass.contains("\r")) {
+            showMessage("Use 4+ characters without outer spaces.");
             return;
         }
         if (findUser(user) != null) {
@@ -3200,25 +3185,16 @@ class LoginDialog extends JDialog {
 
         try (BufferedReader reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
             String line = reader.readLine();
-            boolean hashed = "# ledger-users-v2".equals(line);
-            if (hashed) line = reader.readLine();
             while (line != null) {
                 int split = line.indexOf(';');
                 if (split > 0) {
                     String name = line.substring(0, split).trim();
                     String pass = line.substring(split + 1).trim();
                     if (name.length() > 0) {
-                        users.add(hashed ? FinancialTracker.User.fromStored(name, pass)
-                                : new FinancialTracker.User(name, pass));
+                        users.add(new FinancialTracker.User(name, pass));
                     }
                 }
                 line = reader.readLine();
-            }
-            // Legacy plaintext accounts are converted on first load; usernames and passwords stay unchanged.
-            if (!hashed) {
-                // Close the reader first so the atomic replacement works on Windows.
-                reader.close();
-                if (!saveUsers()) showMessage("Password migration could not be saved.");
             }
         } catch (Exception e) {
             users.clear();
@@ -3233,9 +3209,8 @@ class LoginDialog extends JDialog {
             Path file = userFile().toPath();
             temp = Files.createTempFile(file.toAbsolutePath().getParent(), "ledger-users-", ".tmp");
             try (Writer writer = Files.newBufferedWriter(temp, StandardCharsets.UTF_8)) {
-                writer.write("# ledger-users-v2\n");
                 for (FinancialTracker.User account : users) {
-                    writer.write(account.username + ";" + account.passwordHash + "\n");
+                    writer.write(account.username + ";" + account.password + "\n");
                 }
             }
             try {
